@@ -1,20 +1,13 @@
 ## Commands
 
-### v1 — local files and package DB
-
 ```
 xpkg install <file.xpkg>   Install a package from a local file
+xpkg install <name>        Fetch <name> from a configured repo and install
 xpkg remove <name>         Remove an installed package
 xpkg list                  List installed packages
 xpkg info <name>           Show details for an installed package
 xpkg files <name>          List files owned by an installed package
 xpkg verify <name>         Re-hash installed files, report changes
-```
-
-### v2 — repo fetch-by-name (implemented)
-
-```
-xpkg install <name>        Fetch <name> from a configured repo and install
 xpkg repo add <url>        Add a repo (http:// or https://) to repos.conf
 xpkg repo remove <url>     Remove a repo
 xpkg repo list             List configured repos
@@ -69,17 +62,17 @@ Publish flow: build each package into a staging tree → run `xpkg-create`
 to produce `.xpkg` + add entries to `index.json` → upload both to the HF
 dataset → every user does `xpkg repo add <dataset URL>` once.
 
-## Roadmap / status (2026-09-03)
+## Status (2026-09-03)
 
-- **v1** — local-file install/remove/list/info/files/verify: built and
-  verified (static x86-64 ELF, zero warnings).
-- **v2** — `xpkg repo add/remove/list` + `xpkg install <name>` fetch by
-  name over HTTP/HTTPS with sha256 verification: **built and verified**
-  against a local HTTP repo, and the HTTPS/TLS/redirect path verified
-  live against huggingface.co.
-- **v2 bug fixed** — install no longer leaves state in the install-scratch
-  dir, so each package owns exactly its own files (no cross-package
-  leakage when multiple packages are installed back-to-back).
+- Local-file and repo install all **built and verified** (static x86-64
+  ELF, zero warnings): install/remove/list/info/files/verify, plus
+  repo add/remove/list and `install <name>` fetch-by-name over
+  HTTP/HTTPS with sha256 verification (end-to-end against a local HTTP
+  repo, and the HTTPS/TLS/redirect path verified live against
+  huggingface.co).
+- Install clears its scratch dir each time, so each package owns exactly
+  its own files (no cross-package leakage when packages are installed
+  back-to-back).
 - **Later** — `xpkg update` (refresh cached repo indexes), a real
   dependency resolver, upgrading in place.
 
