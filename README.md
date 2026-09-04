@@ -65,12 +65,13 @@ https://huggingface.co/datasets/FreeLinX/packages/resolve/main/
 
 Publish flow: build each package into a staging tree → run `xpkg-create`
 to produce `.xpkg` + add entries to `index.json` → upload both to the HF
-dataset (e.g. `huggingface-cli upload FreeLinX/packages <files>`).
+dataset. Upload with the `hf` CLI from the `hfenv` venv
+(`hf upload FreeLinX/packages <file> --repo-type dataset`).
 
 Verified end-to-end over HTTPS from Hugging Face: `xpkg repo add
 https://huggingface.co/datasets/FreeLinX/packages/resolve/main` then
-`xpkg install sv`/`install pfetch` fetched → sha256-verified → installed,
-with no local server.
+`xpkg install <name>` fetched → sha256-verified → installed, with no local
+server.
 
 ## Status (2026-09-04)
 
@@ -79,8 +80,11 @@ with no local server.
   repo add/remove/list and `install <name>` fetch-by-name over
   HTTP/HTTPS with sha256 verification.
 - **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
-  — install from it over HTTPS verified end-to-end (`sv`, `chpst`,
-  `clear`, `pfetch`).
+  — **97 packages** (NetBSD 10.1 base utils, runit's sv/chpst/runsv/
+  runsvdir, dhcpcd, wpa_supplicant/wpa_cli/wpa_passphrase, flx-ifconfig/
+  flx-route/flx-wifi, pfetch, clear) plus **lynx 2.9.2** (text-mode web
+  browser, static, HTTPS via OpenSSL + bundled CA bundle). Install over
+  HTTPS verified end-to-end with the shipped `xpkg` binary.
 - Install clears its scratch dir each time, so each package owns exactly
   its own files (no cross-package leakage when packages are installed
   back-to-back).
