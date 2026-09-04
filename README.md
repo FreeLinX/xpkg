@@ -53,23 +53,34 @@ layout differs from the defaults (see Makefile).
 
 ## Hosting the public repo
 
-The intended public binary repo is a Hugging Face **Dataset** — free, no
-large-file cap, stable `https://huggingface.co/datasets/<owner>/<repo>/resolve/main/<file>`
-URLs, HTTPS-only (no plaintext HTTP). `repos.conf`/`index.json` are
-host-agnostic, so any static HTTPS host (incl. Cloudflare R2) works.
+The public binary repo is a Hugging Face **Dataset** — free, no large-file
+cap, stable HTTPS URLs, reachable from anywhere. Verified live:
+
+```
+https://huggingface.co/datasets/FreeLinX/packages/resolve/main/
+```
+
+(That's the `repos.conf` URL; xpkg appends `index.json` for the index and
+`<file>` for each package.)
 
 Publish flow: build each package into a staging tree → run `xpkg-create`
 to produce `.xpkg` + add entries to `index.json` → upload both to the HF
-dataset → every user does `xpkg repo add <dataset URL>` once.
+dataset (e.g. `huggingface-cli upload FreeLinX/packages <files>`).
 
-## Status (2026-09-03)
+Verified end-to-end over HTTPS from Hugging Face: `xpkg repo add
+https://huggingface.co/datasets/FreeLinX/packages/resolve/main` then
+`xpkg install sv`/`install pfetch` fetched → sha256-verified → installed,
+with no local server.
+
+## Status (2026-09-04)
 
 - Local-file and repo install all **built and verified** (static x86-64
   ELF, zero warnings): install/remove/list/info/files/verify, plus
   repo add/remove/list and `install <name>` fetch-by-name over
-  HTTP/HTTPS with sha256 verification (end-to-end against a local HTTP
-  repo, and the HTTPS/TLS/redirect path verified live against
-  huggingface.co).
+  HTTP/HTTPS with sha256 verification.
+- **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
+  — install from it over HTTPS verified end-to-end (`sv`, `chpst`,
+  `clear`, `pfetch`).
 - Install clears its scratch dir each time, so each package owns exactly
   its own files (no cross-package leakage when packages are installed
   back-to-back).
