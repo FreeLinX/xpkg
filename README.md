@@ -80,7 +80,7 @@ server.
   repo add/remove/list and `install <name>` fetch-by-name over
   HTTP/HTTPS with sha256 verification.
 - **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
-  — **176 packages** (NetBSD 10.1 base utils, runit's sv/chpst/runsv/
+  — **180 packages** (NetBSD 10.1 base utils, runit's sv/chpst/runsv/
   runsvdir, dhcpcd, wpa_supplicant/wpa_cli/wpa_passphrase, flx-ifconfig/
   flx-route/flx-wifi, pfetch, clear, awk, less, ninja, toybox, diff, ftp,
   fastfetch) plus **lynx 2.9.2** (text-mode web browser, static, HTTPS via
