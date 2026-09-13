@@ -29,7 +29,7 @@ FREELINX_TOOLCHAIN_DIR  ?= $(FREELINX_ROOT)/../toolchain
 FREELINX_TRIPLE         ?= x86_64-linux-musl
 FREELINX_CC             ?= $(FREELINX_TOOLCHAIN_DIR)/bin/clang
 FREELINX_SYSROOT        ?= $(FREELINX_TOOLCHAIN_DIR)/x86_64-linux-musl
-FREELINX_PORTS_DEPS     ?= $(FREELINX_ROOT)/../ports-actual/build/deps
+FREELINX_PORTS_DEPS     ?= $(shell [ -d "$(FREELINX_ROOT)/../ports/build/deps" ] && echo "$(FREELINX_ROOT)/../ports/build/deps" || echo "$(FREELINX_ROOT)/../ports-actual/build/deps")
 
 CC := $(FREELINX_CC)
 
@@ -52,6 +52,7 @@ LDFLAGS = --target=$(FREELINX_TRIPLE) --sysroot=$(FREELINX_SYSROOT) \
 LDLIBS  = -lsqlite3 -lz -lssl -lcrypto -lpthread -ldl
 
 SRCS = src/main.c src/pkginfo.c src/db.c src/tar.c src/hash.c \
+       src/paths.c src/version.c \
        src/cmd_install.c src/cmd_other.c \
        src/net.c src/repo.c
 OBJS = $(SRCS:.c=.o)

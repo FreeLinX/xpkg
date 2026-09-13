@@ -1,17 +1,18 @@
 /* main.c - xpkg entry point: argument parsing and command dispatch.
  *
- * v1 command set (local state):
- *     xpkg install <file.xpkg>
- *     xpkg remove <name>
- *     xpkg list
- *     xpkg info <name>
- *     xpkg files <name>
- *     xpkg verify <name>
- * v2 command set (package repos, network):
- *     xpkg install <name>          fetch <name> from repos.conf, install
- *     xpkg repo add <url>          add a repo (index.json + .xpkg host)
- *     xpkg repo remove <url>       remove a repo
- *     xpkg repo list               list configured repos
+ * Command set:
+ *     xpkg install <file.xpkg>    install from a local .xpkg file
+ *     xpkg install <name>         fetch <name> (and its DEPENDS) from a repo
+ *     xpkg remove <name>          remove an installed package
+ *     xpkg list                   list installed packages
+ *     xpkg info <name>            show details for an installed package
+ *     xpkg files <name>           list files owned by an installed package
+ *     xpkg verify <name>          re-hash installed files, report changes
+ *     xpkg update                 refresh the cached repo index
+ *     xpkg upgrade <name>         upgrade one installed package
+ *     xpkg upgrade-all            upgrade every installed package with a newer
+ *                                 version available in a repo
+ *     xpkg repo add/remove/list   manage configured repos
  */
 #include <stdio.h>
 #include <string.h>
@@ -22,17 +23,21 @@ static void usage(const char *argv0) {
         "xpkg %s - FreeLinX package manager\n\n"
         "Usage:\n"
         "  %s install <file.xpkg>   Install from a local .xpkg file\n"
-        "  %s install <name>        Fetch and install <name> from a repo\n"
+        "  %s install <name>        Fetch and install <name> from a repo (deps auto)\n"
         "  %s remove <name>         Remove an installed package\n"
         "  %s list                  List installed packages\n"
         "  %s info <name>           Show details for an installed package\n"
         "  %s files <name>          List files owned by an installed package\n"
         "  %s verify <name>         Re-hash installed files, report changes\n"
+        "  %s update                Refresh the cached repo indexes\n"
+        "  %s upgrade <name>        Upgrade one installed package\n"
+        "  %s upgrade-all           Upgrade all installed packages\n"
         "  %s repo add <url>        Add a package repo\n"
         "  %s repo remove <url>     Remove a package repo\n"
         "  %s repo list             List configured repos\n",
-        XPKG_VERSION, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0);
+        XPKG_VERSION,
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+        argv0, argv0, argv0, argv0, argv0);
 }
 
 /* A "name" (repo fetch) has no path separators and no .xpkg suffix. */
@@ -84,6 +89,16 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "verify") == 0) {
         if (argc < 3) { usage(argv[0]); return 1; }
         return xpkg_cmd_verify(argv[2]);
+    }
+    if (strcmp(cmd, "update") == 0) {
+        return xpkg_cmd_update();
+    }
+    if (strcmp(cmd, "upgrade") == 0) {
+        if (argc < 3) { usage(argv[0]); return 1; }
+        return xpkg_cmd_upgrade(argv[2]);
+    }
+    if (strcmp(cmd, "upgrade-all") == 0) {
+        return xpkg_cmd_upgrade_all();
     }
     if (strcmp(cmd, "repo") == 0) {
         if (argc < 3) { usage(argv[0]); return 1; }

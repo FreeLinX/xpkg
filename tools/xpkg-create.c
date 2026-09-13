@@ -214,12 +214,14 @@ static void write_payload(gzFile gz, FILE *in, unsigned long size) {
 static int cmd_create(int argc, char **argv) {
     const char *name = NULL, *version = NULL, *desc = "No description";
     const char *arch = "x86_64", *stage = NULL, *output = NULL;
+    const char *depends = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--version") && i + 1 < argc) version = argv[++i];
         else if (!strcmp(argv[i], "--description") && i + 1 < argc) desc = argv[++i];
         else if (!strcmp(argv[i], "--arch") && i + 1 < argc) arch = argv[++i];
+        else if (!strcmp(argv[i], "--depends") && i + 1 < argc) depends = argv[++i];
         else if (!strcmp(argv[i], "--stage") && i + 1 < argc) stage = argv[++i];
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
         else {
@@ -230,7 +232,8 @@ static int cmd_create(int argc, char **argv) {
     if (!name || !version || !stage || !output) {
         fprintf(stderr,
                 "usage: xpkg-create create --name N --version V "
-                "[--description D] [--arch A] --stage DIR --output OUT.xpkg\n");
+                "[--description D] [--arch A] [--depends X,Y] "
+                "--stage DIR --output OUT.xpkg\n");
         return 2;
     }
 
@@ -256,6 +259,9 @@ static int cmd_create(int argc, char **argv) {
     fprintf(pkginfo, "VERSION=%s\n", version);
     fprintf(pkginfo, "DESCRIPTION=%s\n", desc);
     fprintf(pkginfo, "ARCH=%s\n", arch);
+    if (depends && depends[0]) {
+        fprintf(pkginfo, "DEPENDS=%s\n", depends);
+    }
     fflush(pkginfo);
 
     long pkginfo_size;

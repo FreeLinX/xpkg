@@ -30,15 +30,15 @@
 #include "xpkg.h"
 
 static xpkg_status_t open_db(sqlite3 **db) {
-    /* XPKG_DB_DIR must exist before sqlite3_open can create the db file
+    /* xpkg_db_dir() must exist before sqlite3_open can create the db file
      * inside it. mkdir failing because the directory already exists is
      * fine and expected on every call after the first; any other mkdir
      * failure will surface naturally when sqlite3_open itself fails. */
-    mkdir(XPKG_DB_DIR, 0755);
+    mkdir(xpkg_db_dir(), 0755);
 
-    if (sqlite3_open(XPKG_DB_PATH, db) != SQLITE_OK) {
+    if (sqlite3_open(xpkg_db_path(), db) != SQLITE_OK) {
         fprintf(stderr, "xpkg: cannot open database at %s: %s\n",
-                XPKG_DB_PATH, sqlite3_errmsg(*db));
+                xpkg_db_path(), sqlite3_errmsg(*db));
         sqlite3_close(*db);
         return XPKG_ERR_DB;
     }
@@ -256,4 +256,98 @@ xpkg_status_t xpkg_db_files(const char *pkg_name) {
         return XPKG_ERR_NOT_FOUND;
     }
     return XPKG_OK;
+}
+
+xpkg_status_t xpkg_db_get_version(const char *pkg_name, char *out, size_t outsz) {
+    sqlite3 *db;
+    xpkg_status_t st = open_db(&db);
+    if (st != XPKG_OK) return st;
+
+    out[0] = '\0';
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT version FROM packages WHERE name = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return XPKG_ERR_DB;
+    }
+    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *v = (const char *)sqlite3_column_text(stmt, 0);
+        if (v) {
+            strncpy(out, v, outsz - 1);
+            out[outsz - 1] = '\0';
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return XPKG_OK;
+}
+
+/* Deletes all file rows for a package without touching the package row
+ * itself (used by redeploying/upgrade, where the file set is re-written). */
+xpkg_status_t xpkg_db_clear_files(const char *pkg_name) {
+    sqlite3 *db;
+    xpkg_status_t st = open_db(&db);
+    if (st != XPKG_OK) return st;
+
+    sqlite3_stmt *stmt;
+    const char *sql = "DELETE FROM files WHERE package_name = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return XPKG_ERR_DB;
+    }
+    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return XPKG_OK;
+}
+
+xpkg_status_t xpkg_db_set_version(const char *pkg_name, const char *version) {
+    sqlite3 *db;
+    xpkg_status_t st = open_db(&db);
+    if (st != XPKG_OK) return st;
+
+    sqlite3_stmt *stmt;
+    const char *sql = "UPDATE packages SET version = ? WHERE name = ?;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return XPKG_ERR_DB;
+    }
+    sqlite3_bind_text(stmt, 1, version, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, pkg_name, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    return (rc == SQLITE_DONE) ? XPKG_OK : XPKG_ERR_DB;
+}
+
+xpkg_status_t xpkg_db_foreach(xpkg_db_pkg_iterator it, void *user) {
+    sqlite3 *db;
+    xpkg_status_t st = open_db(&db);
+    if (st != XPKG_OK) return st;
+
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT name FROM packages ORDER BY name;";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return XPKG_ERR_DB;
+    }
+
+    xpkg_status_t ret = XPKG_OK;
+    int early = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        if (it && !it(name, user)) {
+            early = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    if (early) ret = XPKG_ERR_NOT_FOUND; /* signal the caller stopped iteration */
+    return ret;
 }

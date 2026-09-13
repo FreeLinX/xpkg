@@ -20,7 +20,7 @@ int xpkg_cmd_remove(const char *name) {
      * since actually unlinking files is a filesystem operation, not a
      * database one -- db.c only owns the sqlite schema/queries. */
     sqlite3 *db;
-    if (sqlite3_open(XPKG_DB_PATH, &db) != SQLITE_OK) {
+    if (sqlite3_open(xpkg_db_path(), &db) != SQLITE_OK) {
         fprintf(stderr, "xpkg: cannot open database\n");
         return 1;
     }
@@ -32,7 +32,9 @@ int xpkg_cmd_remove(const char *name) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             const char *path = (const char *)sqlite3_column_text(stmt, 0);
             printf("  removing %s\n", path);
-            remove(path);
+            char full[XPKG_MAX_PATH];
+            snprintf(full, sizeof(full), "%s%s", xpkg_root(), path);
+            remove(full);
         }
         sqlite3_finalize(stmt);
     }
@@ -64,7 +66,7 @@ int xpkg_cmd_verify(const char *name) {
     }
 
     sqlite3 *db;
-    if (sqlite3_open(XPKG_DB_PATH, &db) != SQLITE_OK) {
+    if (sqlite3_open(xpkg_db_path(), &db) != SQLITE_OK) {
         fprintf(stderr, "xpkg: cannot open database\n");
         return 1;
     }
@@ -78,8 +80,11 @@ int xpkg_cmd_verify(const char *name) {
             const char *path = (const char *)sqlite3_column_text(stmt, 0);
             const char *expected = (const char *)sqlite3_column_text(stmt, 1);
 
+            char full[XPKG_MAX_PATH];
+            snprintf(full, sizeof(full), "%s%s", xpkg_root(), path);
+
             char actual[65];
-            if (xpkg_sha256_file(path, actual) != XPKG_OK) {
+            if (xpkg_sha256_file(full, actual) != XPKG_OK) {
                 printf("MISSING  %s\n", path);
                 ok = 0;
                 continue;
