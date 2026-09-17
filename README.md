@@ -81,8 +81,8 @@ server.
   HTTP/HTTPS with sha256 verification.
 - **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
   — **180 packages** (NetBSD 10.1 base utils, runit's sv/chpst/runsv/
-  runsvdir, dhcpcd, wpa_supplicant/wpa_cli/wpa_passphrase, flx-ifconfig/
-  flx-route/flx-wifi, pfetch, clear, awk, less, ninja, toybox, diff, ftp,
+  runsvdir, dhcpcd, wpa_supplicant/wpa_cli/wpa_passphrase, flxifconfig/
+  flxroute/flxwifi, pfetch, clear, awk, less, ninja, toybox, diff, ftp,
   fastfetch) plus **lynx 2.9.2** (text-mode web browser, static, HTTPS via
   OpenSSL + bundled CA bundle). Install over HTTPS verified end-to-end
   with the shipped `xpkg` binary.
