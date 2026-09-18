@@ -4,6 +4,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <sqlite3.h>
 #include "xpkg.h"
 
@@ -83,11 +85,36 @@ int xpkg_cmd_verify(const char *name) {
             char full[XPKG_MAX_PATH];
             snprintf(full, sizeof(full), "%s%s", xpkg_root(), path);
 
+            /* Symlink entries were registered with the digest of their
+             * link target string; re-check them via lstat + readlink
+             * rather than hashing the content their target resolves to. */
+            struct stat lst;
             char actual[65];
-            if (xpkg_sha256_file(full, actual) != XPKG_OK) {
+            if (lstat(full, &lst) != 0) {
                 printf("MISSING  %s\n", path);
                 ok = 0;
                 continue;
+            }
+            if (S_ISLNK(lst.st_mode)) {
+                char target[XPKG_MAX_PATH];
+                ssize_t ln = readlink(full, target, sizeof(target) - 1);
+                if (ln < 0) {
+                    printf("MISSING  %s\n", path);
+                    ok = 0;
+                    continue;
+                }
+                target[ln] = '\0';
+                if (xpkg_sha256_str(target, actual) != XPKG_OK) {
+                    printf("MISSING  %s\n", path);
+                    ok = 0;
+                    continue;
+                }
+            } else {
+                if (xpkg_sha256_file(full, actual) != XPKG_OK) {
+                    printf("MISSING  %s\n", path);
+                    ok = 0;
+                    continue;
+                }
             }
             if (strcmp(actual, expected) != 0) {
                 printf("MODIFIED %s\n", path);

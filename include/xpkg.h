@@ -3,6 +3,9 @@
  * Design (agreed 2026-09-01):
  *   - .xpkg files are gzip'd ustar archives containing a top-level
  *     "pkg-info" metadata file plus a "files/" tree extracted relative to /.
+ *     Entries are regular files ('0'), directories ('5'), and symlinks
+ *     ('2', linkname field), since the desktop stack ships real symlinks
+ *     (e.g. /usr/bin/openbox -> ../share/X11/xtree/bin/openbox).
  *   - Installed-package state lives in a SQLite database at
  *     /var/lib/xpkg/xpkg.db (packages + files tables).
  *   - Local-file install (`xpkg install <file.xpkg>`) plus network/repo
@@ -115,6 +118,7 @@ xpkg_status_t xpkg_db_foreach(xpkg_db_pkg_iterator it, void *user);
  * Writes a 65-byte (64 hex chars + NUL) lowercase SHA256 hex digest of the
  * file at `path` into `out`. */
 xpkg_status_t xpkg_sha256_file(const char *path, char out[65]);
+xpkg_status_t xpkg_sha256_str(const char *s, char out[65]);
 
 /* --- tar.c --------------------------------------------------------------
  * Minimal ustar reader. Extracts a gzip'd tar archive (already

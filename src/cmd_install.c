@@ -58,8 +58,9 @@ static void rm_tree(const char *dir) {
 
 /* Recursively copies the src_root files tree into / (dest_root), recording each
  * regular file's path (relative to /) and hash via the callback-style
- * registration calls. Directories are created as needed but not
- * separately recorded in the files table -- only files are tracked for
+ * registration calls. Symlink entries are recreated as symlinks and registered
+ * with the digest of their target string. Directories are created as needed but
+ * not separately recorded in the files table -- only files are tracked for
  * ownership/removal purposes, matching the schema design. */
 static xpkg_status_t copy_tree(const char *src_dir, const char *rel_prefix, const char *pkg_name) {
     DIR *d = opendir(src_dir);
@@ -79,7 +80,7 @@ static xpkg_status_t copy_tree(const char *src_dir, const char *rel_prefix, cons
         snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, entry->d_name);
 
         struct stat st;
-        if (stat(src_path, &st) != 0) {
+        if (lstat(src_path, &st) != 0) {
             continue;
         }
 
@@ -93,6 +94,29 @@ static xpkg_status_t copy_tree(const char *src_dir, const char *rel_prefix, cons
                 closedir(d);
                 return st2;
             }
+        } else if (S_ISLNK(st.st_mode)) {
+            /* Symlink: recreate it, then register with the digest of its
+             * target string (what `xpkg verify` re-checks via readlink). */
+            char target[XPKG_MAX_PATH];
+            ssize_t ln = readlink(src_path, target, sizeof(target) - 1);
+            if (ln < 0) {
+                closedir(d);
+                return XPKG_ERR_IO;
+            }
+            target[ln] = '\0';
+            if (symlink(target, dest_path) != 0) {
+                fprintf(stderr, "xpkg: cannot create symlink %s -> %s\n",
+                        dest_path, target);
+                closedir(d);
+                return XPKG_ERR_IO;
+            }
+
+            char digest[65];
+            if (xpkg_sha256_str(target, digest) == XPKG_OK) {
+                xpkg_db_register_file(pkg_name, rel_path, digest);
+            }
+
+            printf("  %s -> %s\n", rel_path, target);
         } else if (S_ISREG(st.st_mode)) {
             FILE *in = fopen(src_path, "rb");
             if (!in) { closedir(d); return XPKG_ERR_IO; }
@@ -115,7 +139,7 @@ static xpkg_status_t copy_tree(const char *src_dir, const char *rel_prefix, cons
 
             printf("  %s\n", rel_path);
         }
-        /* symlinks etc: not present in v1 archives per tar.c's scope */
+        /* special files: not present in archives per tar.c's scope */
     }
 
     closedir(d);
@@ -215,10 +239,10 @@ static size_t collect_files(const char *srcdir, const char *rel, char list[][XPK
         snprintf(full, sizeof(full), "%s/%s", rel, e->d_name);
 
         struct stat st;
-        if (stat(src, &st) != 0) continue;
+        if (lstat(src, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
             n += collect_files(src, full, list + n, cap - n);
-        } else if (S_ISREG(st.st_mode)) {
+        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
             strncpy(list[n], full, XPKG_MAX_PATH - 1);
             list[n][XPKG_MAX_PATH - 1] = '\0';
             n++;

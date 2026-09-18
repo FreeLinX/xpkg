@@ -72,9 +72,11 @@ static unsigned int ustar_checksum(const unsigned char *hdr) {
 struct filespec {
     char relpath[PATH_MAX_LOCAL];  /* path as stored in the archive (files/...) */
     char ondisk[PATH_MAX_LOCAL];   /* path on the build host to read content from */
+    char linkname[PATH_MAX_LOCAL]; /* symlink target, when is_symlink */
     unsigned long size;
     mode_t mode;
     int is_dir;
+    int is_symlink;
 };
 
 #define MAX_FILES 16384
@@ -120,6 +122,8 @@ static int collect_dir(const char *dir, const char *arch_prefix) {
             f->size = (unsigned long)st.st_size;
             f->mode = st.st_mode & 07777;
             f->is_dir = 0;
+            f->is_symlink = 0;
+            f->linkname[0] = '\0';
         } else if (S_ISDIR(st.st_mode)) {
             struct filespec *f = &g_entries[g_nentries++];
             strncpy(f->relpath, arch_path, sizeof(f->relpath) - 1);
@@ -127,21 +131,43 @@ static int collect_dir(const char *dir, const char *arch_prefix) {
             f->size = 0;
             f->mode = 0755;
             f->is_dir = 1;
+            f->is_symlink = 0;
+            f->linkname[0] = '\0';
             /* recurse with this dir as the new prefix */
             if (collect_dir(disk, arch_path + strlen("files/")) != 0) {
                 closedir(d);
                 return -1;
             }
+        } else if (S_ISLNK(st.st_mode)) {
+            /* Symlinks are real: record the target and pack it as a ustar
+             * typeflag '2' entry (no payload). The client recreates them on
+             * install, so packages faithfully reproduce the tested rootfs. */
+            struct filespec *f = &g_entries[g_nentries++];
+            strncpy(f->relpath, arch_path, sizeof(f->relpath) - 1);
+            strncpy(f->ondisk, disk, sizeof(f->ondisk) - 1);
+            f->size = 0;
+            f->mode = 0777;
+            f->is_dir = 0;
+            f->is_symlink = 1;
+            ssize_t ln = readlink(disk, f->linkname, sizeof(f->linkname) - 1);
+            if (ln < 0) {
+                fprintf(stderr, "xpkg-create: readlink %s: %s\n", disk, strerror(errno));
+                closedir(d);
+                return -1;
+            }
+            f->linkname[ln] = '\0';
         }
-        /* other types (symlink, special): skipped, matching tar.c's scope */
+        /* other types (special): skipped, matching tar.c's scope */
     }
     closedir(d);
     return 0;
 }
 
-/* Write one ustar header block for the given archive file. */
+/* Write one ustar header block for the given archive file. linkname is
+ * written into the header only for symlink ('2') entries; it may be NULL
+ * otherwise. */
 static void write_header(gzFile gz, const char *path, unsigned long size,
-                         mode_t mode, char typeflag) {
+                         mode_t mode, char typeflag, const char *linkname) {
     unsigned char block[USTAR_BLOCK];
     memset(block, '\0', USTAR_BLOCK);
 
@@ -167,6 +193,10 @@ static void write_header(gzFile gz, const char *path, unsigned long size,
     set_octal((char *)block + 136, 12, 0); /* mtime */
     /* chksum field 148..156: leave NUL, patched below */
     block[156] = typeflag;                /* typeflag */
+    /* linkname field at offset 157 (ustar), 100 bytes: only for '2'. */
+    if (typeflag == '2' && linkname && linkname[0]) {
+        memcpy(block + 157, linkname, strlen(linkname) > 100 ? 100 : strlen(linkname));
+    }
     /* magic "ustar\0" + "00" */
     memcpy(block + 257, "ustar", 6);
     block[263] = '0'; block[264] = '0';
@@ -270,7 +300,7 @@ static int cmd_create(int argc, char **argv) {
         pkginfo_size = ftell(pkginfo);
         fseek(pkginfo, 0, SEEK_SET);
     }
-    write_header(gz, "pkg-info", (unsigned long)pkginfo_size, 0644, '0');
+    write_header(gz, "pkg-info", (unsigned long)pkginfo_size, 0644, '0', NULL);
     {
         unsigned char buf[USTAR_BLOCK];
         long remaining = pkginfo_size;
@@ -292,7 +322,7 @@ static int cmd_create(int argc, char **argv) {
     for (int i = 0; i < g_nentries; i++) {
         struct filespec *f = &g_entries[i];
         if (f->is_dir) {
-            write_header(gz, f->relpath, 0, f->mode, '5');
+            write_header(gz, f->relpath, 0, f->mode, '5', NULL);
         }
     }
     for (int i = 0; i < g_nentries; i++) {
@@ -300,7 +330,12 @@ static int cmd_create(int argc, char **argv) {
         if (f->is_dir) {
             continue;
         }
-        write_header(gz, f->relpath, f->size, f->mode, '0');
+        if (f->is_symlink) {
+            /* symlink: typeflag '2', linkname in the header, no payload */
+            write_header(gz, f->relpath, 0, f->mode, '2', f->linkname);
+            continue;
+        }
+        write_header(gz, f->relpath, f->size, f->mode, '0', NULL);
         FILE *in = fopen(f->ondisk, "rb");
         if (!in) {
             fprintf(stderr, "xpkg-create: cannot read %s\n", f->ondisk);

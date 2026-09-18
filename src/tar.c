@@ -2,16 +2,16 @@
  * so gzip decompression and tar parsing happen in one pass with no
  * external `tar`/`gzip` process invoked.
  *
- * v1 scope (documented in xpkg.h): regular files and directories only.
- * No symlinks, hardlinks, or special files -- every package built so far
- * (netbsd-sh, runit, pfetch) is plain files and directories, so this
- * covers real, current need rather than speculative completeness. Revisit
- * if a future port genuinely ships a symlink that matters.
+ * v1 scope: regular files and directories only. v2: symlinks (typeflag
+ * '2') are supported — the desktop stack (openbox, st xterm/uxterm, urxvt
+ * rxvt, mupdf) ships real symlinks that must survive a package round-trip.
+ * Hardlinks and special files remain out of scope.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <zlib.h>
 #include "xpkg.h"
 
@@ -117,6 +117,20 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
             /* Directory entry. */
             mkdir_parents(full_path);
             mkdir(full_path, 0755);
+        } else if (hdr->typeflag == '2') {
+            /* Symlink: recreate the link. The target is stored in the
+             * linkname field (100 bytes, may not be NUL-terminated). */
+            char linkname[101];
+            memcpy(linkname, hdr->linkname, 100);
+            linkname[100] = '\0';
+
+            mkdir_parents(full_path);
+            if (symlink(linkname, full_path) != 0) {
+                fprintf(stderr, "xpkg: cannot create symlink %s -> %s\n",
+                        full_path, linkname);
+                gzclose(gz);
+                return XPKG_ERR_IO;
+            }
         } else if (hdr->typeflag == '0' || hdr->typeflag == '\0') {
             /* Regular file. */
             mkdir_parents(full_path);
