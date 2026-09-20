@@ -80,12 +80,12 @@ server.
   repo add/remove/list and `install <name>` fetch-by-name over
   HTTP/HTTPS with sha256 verification.
 - **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
-  — **180 packages** (NetBSD 10.1 base utils, runit's sv/chpst/runsv/
-  runsvdir, dhcpcd, wpa_supplicant/wpa_cli/wpa_passphrase, flxifconfig/
-  flxroute/flxwifi, pfetch, clear, awk, less, ninja, toybox, diff, ftp,
-  fastfetch) plus **lynx 2.9.2** (text-mode web browser, static, HTTPS via
-  OpenSSL + bundled CA bundle). Install over HTTPS verified end-to-end
-  with the shipped `xpkg` binary.
+  — the **313-package set** built from `../ports` (220 NetBSD 10.1 base
+  utilities, the classic BSD games, and the full userland/tooling set:
+  runit, dhcpcd, wpa_supplicant, freelinx-ifconfig/freelinx-route, pfetch,
+  clear, awk, less, ninja, toybox, diff, ftp, fastfetch, git, vim, tmux,
+  plus the xorg/openbox desktop stack). Install over HTTPS verified
+  end-to-end with the shipped `xpkg` binary.
 - Install clears its scratch dir each time, so each package owns exactly
   its own files (no cross-package leakage when packages are installed
   back-to-back).
