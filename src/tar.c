@@ -46,6 +46,38 @@ static long parse_octal(const char *field, size_t len) {
     return strtol(buf, NULL, 8);
 }
 
+/* Rejects archive entries that would escape the extraction root via ".."
+ * components in the ustar name/prefix fields (path traversal). xpkg extracts
+ * and installs as root, so this must be strict: a leading ".." (going above
+ * dest_dir) is refused unless every later component brings the depth back
+ * to >= 0. "." components are harmless. Returns 1 when safe, 0 otherwise. */
+static int entry_path_is_safe(const char *prefix, const char *name) {
+    int depth = 0;
+    const char *parts[2] = { prefix, name };
+    for (int i = 0; i < 2; i++) {
+        const char *p = parts[i];
+        if (p == NULL || *p == '\0')
+            continue;
+        const char *c = p;
+        while (*c) {
+            const char *slash = strchr(c, '/');
+            size_t len = slash != NULL ? (size_t)(slash - c) : strlen(c);
+            if (len == 2 && c[0] == '.' && c[1] == '.') {
+                if (--depth < 0)
+                    return 0; /* escapes the extraction root */
+            } else if (len == 1 && c[0] == '.') {
+                /* current directory: no depth change */
+            } else if (len > 0) {
+                depth++;
+            }
+            if (slash == NULL)
+                break;
+            c = slash + 1;
+        }
+    }
+    return 1;
+}
+
 /* Creates every path component of `path` (excluding the final component,
  * which the caller creates itself as either a file or a directory). Mirrors
  * `mkdir -p $(dirname path)`. */
@@ -97,6 +129,14 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
         zero_blocks_seen = 0;
 
         struct ustar_header *hdr = (struct ustar_header *)block;
+
+        /* Refuse path traversal before touching the filesystem. */
+        if (!entry_path_is_safe(hdr->prefix, hdr->name)) {
+            fprintf(stderr, "xpkg: refusing unsafe archive entry: %s/%s\n",
+                    hdr->prefix, hdr->name);
+            gzclose(gz);
+            return XPKG_ERR_BAD_ARCHIVE;
+        }
 
         /* Build the full extraction path: dest_dir + "/" + prefix + name.
          * Long-name "prefix" splitting is part of the ustar spec for paths
