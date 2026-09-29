@@ -1,103 +1,118 @@
-## Commands
+# xpkg — the FreeLinX package manager
+
+xpkg installs, upgrades and removes FreeLinX packages from signed
+repositories. It is written in C against musl, links only zlib, OpenSSL and
+SQLite, and never runs an external `tar`, `gzip` or `curl`.
 
 ```
-xpkg install <file.xpkg>   Install a package from a local file
-xpkg install <name>        Fetch <name> from a configured repo and install
-xpkg remove <name>         Remove an installed package
-xpkg list                  List installed packages
-xpkg info <name>           Show details for an installed package
-xpkg files <name>          List files owned by an installed package
-xpkg verify <name>         Re-hash installed files, report changes
-xpkg repo add <url>        Add a repo (http:// or https://) to repos.conf
-xpkg repo remove <url>     Remove a repo
-xpkg repo list             List configured repos
+xpkg search editor          find packages by name or description
+xpkg show vim               details from the repository
+xpkg install vim git        install, with everything they need
+xpkg remove vim             remove (refused while something needs it)
+xpkg autoremove             drop dependencies nothing needs any more
+xpkg upgrade                refresh the indexes and upgrade everything
+xpkg outdated               what upgrade would change
+xpkg list [-e]              installed packages (-e: only ones you asked for)
+xpkg info | files <name>    an installed package, its files
+xpkg owns /usr/bin/Xorg     which package a file belongs to
+xpkg verify [name...]       check installed files against the database
+xpkg clean                  delete downloaded archives
+xpkg repo list|add|remove   repositories
 ```
 
-- Repos: `/etc/xpkg/repos.conf`, one URL per line.
-- Each repo is expected to serve an `index.json` (name/version/filename/
-  sha256) plus the `.xpkg` files themselves.
-- Install-by-name looks up `index.json`, builds the fetch URL, downloads,
-  verifies the sha256, extracts, and installs. Packages are always
-  installed from the local `cache` copy after checksum verification.
+Options: `-n/--dry-run`, `-f/--force`, `-q`, `-v`, `--root <dir>` (manage a
+system mounted elsewhere, e.g. from the installer), `--allow-unsigned`,
+`--no-scripts`. On the desktop, **Packages** (`flxpkg`) is the graphical front
+end.
 
-## Network / HTTPS notes
+## Trust
 
-- HTTP and HTTPS (TLS 1.2/1.3) via OpenSSL (`-lssl -lcrypto`).
-- Follows redirects, absolute *and* relative `Location` (HF returns
-  relative `Location: /api/...` on its 307s).
-- Supports both `Content-Length` and chunked transfer-encoding bodies.
-- Prefers IPv4 when a host exposes both A and AAAA records (matters on
-  networks with no IPv6 route).
-- Verified live against `huggingface.co` over HTTPS (307 redirect followed
-  to a 200 JSON body), and end-to-end against a local HTTP repo.
+- **Signed indexes.** A repository serves `index.json` and `index.json.sig`,
+  an Ed25519 signature of the exact index bytes. Keys trusted by a system live
+  in `/etc/xpkg/keys/*.pub`; when any key is installed, an unsigned or
+  wrongly signed index is refused. The index pins every archive's size and
+  SHA-256, so a verified index vouches for every package it lists.
+- **Rollback protection.** `generated` in the index may not go backwards
+  between updates, so a mirror cannot replay an old signed index.
+- **TLS** with certificate and host name verification (system CA bundle,
+  `XPKG_CA_FILE` to override); no redirects from HTTPS to HTTP.
+- **Archives are checked every time**, including ones already in the cache.
+- **Safe extraction:** absolute paths, `..` and hardlinks leaving the archive
+  are refused.
 
-## Build dependencies
+## Installing a package
 
-Built against the FreeLinX toolchain (clang + LLD + musl, `-static`,
-`-fuse-ld=lld -rtlib=compiler-rt -unwindlib=none`), linking:
+1. The transaction is planned first: targets and missing dependencies are
+   resolved from the index into dependency order, and the plan and download
+   size are shown.
+2. Every archive is downloaded (with retries on network hiccups) and verified.
+3. Each package is extracted to a private scratch directory, checked for
+   conflicts (a path owned by another package, or a directory where the
+   package has a file), then written file by file to a temporary name and
+   `rename()`d into place, inside one SQLite transaction. A running program,
+   xpkg itself included, is never overwritten in place.
+4. Files the previous version had and the new one does not are removed.
+5. `post-install` runs (with `--root`, inside a chroot).
 
-- zlib (`-lz`)          — gzip (`.xpkg` is gzip'd ustar)
-- openssl (`-lssl -lcrypto`) — HTTPS fetch
-- sqlite (`-lsqlite3`)  — package DB at `/var/lib/xpkg/xpkg.db`
+Configuration under `/etc` that you edited is never overwritten: the packaged
+version is saved as `<file>.xpkgnew`. Removing a package leaves edited
+configuration behind. Hardlinked files stay hardlinked (Mesa ships one driver
+under nine names). Setuid bits are kept.
 
-These are ports built into `build/deps/{zlib,openssl,sqlite}/`; pull them
-in with `FREELINIX_PORTS_DEPS ?= ../ports-actual/build/deps` (see the
-Makefile). `base/sqlite` is a new FreeLinX port (autoconf amalgamation,
-static `libsqlite3.a`) created specifically so xpkg can link `-lsqlite3`.
+## Package format
 
-`tools/xpkg-create.c` is a separate small tool that packages a staging
-tree into `.xpkg` and generates `index.json` (sha256 via OpenSSL).
-
-Override `FREELINIX_CC`/`FREELINIX_SYSROOT`/`FREELINIX_PORTS_DEPS` if your
-layout differs from the defaults (see Makefile).
-
-## Hosting the public repo
-
-The public binary repo is a Hugging Face **Dataset** — free, no large-file
-cap, stable HTTPS URLs, reachable from anywhere. Verified live:
+A `.xpkg` is a gzip'd ustar archive:
 
 ```
-https://huggingface.co/datasets/FreeLinX/packages/resolve/main/
+pkg-info        NAME, VERSION, DESCRIPTION, ARCH, DEPENDS (key=value)
+post-install    optional sh script (install and upgrade)
+pre-remove      optional sh script
+files/...       installed relative to /
 ```
 
-(That's the `repos.conf` URL; xpkg appends `index.json` for the index and
-`<file>` for each package.)
+Long paths and link targets use pax extended headers. Archives are
+reproducible: entries are sorted and carry no timestamps or owners.
 
-Publish flow: build each package into a staging tree → run `xpkg-create`
-to produce `.xpkg` + add entries to `index.json` → upload both to the HF
-dataset. Upload with the `hf` CLI from the `hfenv` venv
-(`hf upload FreeLinX/packages <file> --repo-type dataset`).
+```
+xpkg-create create --name foo --version 1.0-1 --description "..." \
+    --depends bar,baz --stage DIR --output foo-1.0-1.xpkg
+xpkg-create index --dir REPO --output REPO/index.json
+xpkg-create keygen --out NAME            # NAME.key (secret), NAME.pub
+xpkg-create sign --key NAME.key REPO/index.json
+```
 
-Verified end-to-end over HTTPS from Hugging Face: `xpkg repo add
-https://huggingface.co/datasets/FreeLinX/packages/resolve/main` then
-`xpkg install <name>` fetched → sha256-verified → installed, with no local
-server.
+## The public repository
 
-## Status (2026-09-04)
+`https://huggingface.co/datasets/FreeLinX/packages/resolve/main` — about
+390 packages: the NetBSD 10.1 userland, the tools from FreeLinX/ports, and the
+whole desktop stack (Xorg, Mesa, GTK, FreeLinX Web, Bluetooth, ...).
 
-- Local-file and repo install all **built and verified** (static x86-64
-  ELF, zero warnings): install/remove/list/info/files/verify, plus
-  repo add/remove/list and `install <name>` fetch-by-name over
-  HTTP/HTTPS with sha256 verification.
-- **Public repo live**: `https://huggingface.co/datasets/FreeLinX/packages`
-  — the **313-package set** built from `../ports` (220 NetBSD 10.1 base
-  utilities, the classic BSD games, and the full userland/tooling set:
-  runit, dhcpcd, wpa_supplicant, freelinx-ifconfig/freelinx-route, pfetch,
-  clear, awk, less, ninja, toybox, diff, ftp, fastfetch, git, vim, tmux,
-  plus the xorg/openbox desktop stack). Install over HTTPS verified
-  end-to-end with the shipped `xpkg` binary.
-- Install clears its scratch dir each time, so each package owns exactly
-  its own files (no cross-package leakage when packages are installed
-  back-to-back).
-- **Later** — `xpkg update` (refresh cached repo indexes), a real
-  dependency resolver, upgrading in place.
+`tools/publish-repo.sh [--upload]` builds it from `../ports/packages` and
+`../Desktop-test/stack/work/pkgs` (made by `stack/package-stack.sh`, which
+derives every dependency from the ELF files). A publish stops if any archive
+fails `check-nognu.sh` (GCC or glibc code), then writes and signs the index,
+checks the signature against `keys/freelinx.pub` and, with `--upload`, mirrors
+the directory to Hugging Face (removing archives no longer published). The
+signing key stays with the release manager (`~/.config/xpkg/freelinx.key`).
 
-## Related repositories
+## Building and testing
 
-- `toolchain` — the Clang/LLD/musl toolchain xpkg is built with.
-- `ports` — where sqlite (`base/sqlite`, a new port)/zlib/openssl
-  (xpkg's own build dependencies) and every future FreeLinX package's
-  *source* get built. xpkg is the tool that installs the *output* of
-  that pipeline once packaged.
-- `src` — root filesystem; xpkg itself gets staged into
-  `src/rootfs/usr/bin/xpkg` the same way runit/pfetch were.
+The desktop stack builds xpkg (`Desktop-test/stack/build-stack.sh`, step
+`xpkg`). A static build is available through the `Makefile` against
+FreeLinX/ports dependencies.
+
+```
+tests/run-tests.sh <xpkg> <xpkg-create> [runner]
+```
+
+runs 43 end-to-end checks against a signed repository served on localhost:
+dependency resolution, conflicts, config protection, upgrades and stale files,
+hardlinks, pax paths, setuid bits, tampered and unsigned indexes, corrupted
+archives, removal guards and autoremove.
+
+## State
+
+`/var/lib/xpkg/xpkg.db` (packages, files with SHA-256, dependencies; older
+databases are migrated on first use), `/var/cache/xpkg`, `/etc/xpkg`. The
+FreeLinX image registers its desktop stack at build time, so `xpkg list`
+shows what the system actually runs.

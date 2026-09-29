@@ -1,378 +1,288 @@
-/* cmd_install.c - `xpkg install` and the shared package-deploy core.
+/* cmd_install.c - install / reinstall / upgrade: plan, download, deploy.
  *
- * The core deploy function `install_archive()` is used by:
- *   - `xpkg install <file.xpkg>`       (local file; refuse re-installs)
- *   - repo installs                    (via xpkg_cmd_install_ex, which lets
- *                                      already-installed deps pass through)
- *   - `xpkg upgrade <name>`            (via xpkg_cmd_upgrade_archive, which
- *                                      overwrites files, removes stale ones,
- *                                      and bumps the DB version)
- *
- * Deploy steps (matching the design agreed 2026-09-01):
- *   - extract the .xpkg to a scratch directory under the cache dir
- *   - parse its pkg-info
- *   - refuse (or skip) if already installed, per the flags
- *   - verify every DEPENDS entry is installed
- *   - copy files/ into place under /, hashing each file as it goes
- *   - register the package and its files in the database
+ * A transaction is planned completely before anything is touched: targets
+ * and their missing dependencies are resolved from the (signed) indexes into
+ * a dependency-first order, the plan and download size are shown, every
+ * archive is downloaded and checked against the index, and only then are
+ * the packages deployed one by one.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sqlite3.h>
 #include "xpkg.h"
 
-#define MAX_UPGRADE_FILES 8192
+#define MAX_PLAN 4096
 
-enum {
-    INST_NONE           = 0,
-    INST_SKIP_IF_INSTALLED = 1 << 0,
-};
+typedef struct {
+    const xpkg_entry_t *e;
+    const char *local;      /* local archive path instead of a repo entry */
+    xpkg_info_t *linfo;     /* pkg-info of a local archive */
+    int explicit_;
+    int allow_same;
+    char archive[XPKG_MAX_PATH];
+} step_t;
 
-static void scratch_path(char *out, size_t n) {
-    snprintf(out, n, "%s/install-scratch", xpkg_cache_dir());
+static step_t g_plan[MAX_PLAN];
+static int g_nplan;
+static char g_visiting[MAX_PLAN][XPKG_MAX_NAME];
+static int g_nvisiting;
+
+static int plan_find(const char *name) {
+    for (int i = 0; i < g_nplan; i++) {
+        const char *n = g_plan[i].e ? g_plan[i].e->name : g_plan[i].linfo->name;
+        if (!strcmp(n, name)) return i;
+    }
+    return -1;
 }
 
-/* Recursively delete a directory and its contents (used to clear the
- * scratch dir between installs). Minimal, no external tools. */
-static void rm_tree(const char *dir) {
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        char p[XPKG_MAX_PATH];
-        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
-        struct stat st;
-        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
-            rm_tree(p);
-        }
-        unlink(p);
-    }
-    closedir(d);
-    rmdir(dir);
+static int visiting(const char *name) {
+    for (int i = 0; i < g_nvisiting; i++) if (!strcmp(g_visiting[i], name)) return 1;
+    return 0;
 }
 
-/* Recursively copies the src_root files tree into / (dest_root), recording each
- * regular file's path (relative to /) and hash via the callback-style
- * registration calls. Symlink entries are recreated as symlinks and registered
- * with the digest of their target string. Directories are created as needed but
- * not separately recorded in the files table -- only files are tracked for
- * ownership/removal purposes, matching the schema design. */
-static xpkg_status_t copy_tree(const char *src_dir, const char *rel_prefix, const char *pkg_name) {
-    DIR *d = opendir(src_dir);
-    if (!d) {
-        return XPKG_ERR_IO;
-    }
+static int plan_name(const char *name, int explicit_, int reinstall, int need_index);
 
-    struct dirent *entry;
-    while ((entry = readdir(d)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
+/* Dependencies of an entry: from the index, or (old indexes) from the
+ * archive itself. */
+static int plan_deps(const char *pkg, char deps[][XPKG_MAX_NAME], int ndeps) {
+    for (int i = 0; i < ndeps; i++) {
+        char dep[XPKG_MAX_NAME];
+        xpkg_dep_name(deps[i], dep, sizeof(dep));
+        if (!dep[0]) continue;
+        if (visiting(dep)) {
+            xpkg_err("dependency cycle: %s -> %s", pkg, dep);
+            return -1;
         }
-
-        char src_path[XPKG_MAX_PATH];
-        char rel_path[XPKG_MAX_PATH];
-        snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, entry->d_name);
-        snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_prefix, entry->d_name);
-
-        struct stat st;
-        if (lstat(src_path, &st) != 0) {
-            continue;
+        if (plan_name(dep, 0, 0, 1) != 0) {
+            xpkg_err("%s needs %s", pkg, dep);
+            return -1;
         }
-
-        char dest_path[XPKG_MAX_PATH];
-        snprintf(dest_path, sizeof(dest_path), "%s%s", xpkg_root(), rel_path); /* rel_path is already "/"-rooted */
-
-        if (S_ISDIR(st.st_mode)) {
-            mkdir(dest_path, 0755);
-            xpkg_status_t st2 = copy_tree(src_path, rel_path, pkg_name);
-            if (st2 != XPKG_OK) {
-                closedir(d);
-                return st2;
-            }
-        } else if (S_ISLNK(st.st_mode)) {
-            /* Symlink: recreate it, then register with the digest of its
-             * target string (what `xpkg verify` re-checks via readlink). */
-            char target[XPKG_MAX_PATH];
-            ssize_t ln = readlink(src_path, target, sizeof(target) - 1);
-            if (ln < 0) {
-                closedir(d);
-                return XPKG_ERR_IO;
-            }
-            target[ln] = '\0';
-            if (symlink(target, dest_path) != 0) {
-                fprintf(stderr, "xpkg: cannot create symlink %s -> %s\n",
-                        dest_path, target);
-                closedir(d);
-                return XPKG_ERR_IO;
-            }
-
-            char digest[65];
-            if (xpkg_sha256_str(target, digest) == XPKG_OK) {
-                xpkg_db_register_file(pkg_name, rel_path, digest);
-            }
-
-            printf("  %s -> %s\n", rel_path, target);
-        } else if (S_ISREG(st.st_mode)) {
-            FILE *in = fopen(src_path, "rb");
-            if (!in) { closedir(d); return XPKG_ERR_IO; }
-            FILE *out = fopen(dest_path, "wb");
-            if (!out) { fclose(in); closedir(d); return XPKG_ERR_IO; }
-
-            char buf[65536];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-                fwrite(buf, 1, n, out);
-            }
-            fclose(in);
-            fclose(out);
-            chmod(dest_path, st.st_mode & 0777);
-
-            char digest[65];
-            if (xpkg_sha256_file(dest_path, digest) == XPKG_OK) {
-                xpkg_db_register_file(pkg_name, rel_path, digest);
-            }
-
-            printf("  %s\n", rel_path);
-        }
-        /* special files: not present in archives per tar.c's scope */
-    }
-
-    closedir(d);
-    return XPKG_OK;
-}
-
-static xpkg_status_t install_archive(const char *file_path, int flags) {
-    xpkg_db_init();
-
-    char scratch[XPKG_MAX_PATH];
-    scratch_path(scratch, sizeof(scratch));
-    mkdir(xpkg_cache_dir(), 0755);
-    rm_tree(scratch);        /* never trust leftover state from a prior install */
-    mkdir(scratch, 0755);
-
-    printf("xpkg: extracting %s\n", file_path);
-    if (xpkg_tar_extract(file_path, scratch) != XPKG_OK) {
-        fprintf(stderr, "xpkg: failed to extract %s\n", file_path);
-        return XPKG_ERR_IO;
-    }
-
-    char pkginfo_path[XPKG_MAX_PATH];
-    snprintf(pkginfo_path, sizeof(pkginfo_path), "%s/pkg-info", scratch);
-
-    xpkg_info_t info;
-    if (xpkg_parse_pkginfo(pkginfo_path, &info) != XPKG_OK) {
-        fprintf(stderr, "xpkg: %s has no valid pkg-info\n", file_path);
-        return XPKG_ERR_BAD_PKGINFO;
-    }
-
-    {
-        const char *root = xpkg_root();
-        if (root[0]) mkdir(root, 0755);
-    }
-
-    int already;
-    xpkg_db_is_installed(info.name, &already);
-    if (already) {
-        if (flags & INST_SKIP_IF_INSTALLED) {
-            printf("xpkg: %s %s already installed; skipping\n", info.name, info.version);
-            return XPKG_OK;
-        }
-        fprintf(stderr, "xpkg: %s is already installed (use 'xpkg upgrade %s' to update)\n",
-                info.name, info.name);
-        return XPKG_ERR_ALREADY_INSTALLED;
-    }
-
-    for (int i = 0; i < info.depends_count; i++) {
-        int dep_installed;
-        xpkg_db_is_installed(info.depends[i], &dep_installed);
-        if (!dep_installed) {
-            fprintf(stderr, "xpkg: missing dependency: %s (required by %s)\n",
-                    info.depends[i], info.name);
-            return XPKG_ERR_MISSING_DEPENDENCY;
-        }
-    }
-
-    printf("xpkg: installing %s %s\n", info.name, info.version);
-
-    char files_dir[XPKG_MAX_PATH];
-    snprintf(files_dir, sizeof(files_dir), "%s/files", scratch);
-
-    if (copy_tree(files_dir, "", info.name) != XPKG_OK) {
-        fprintf(stderr, "xpkg: failed while copying files for %s\n", info.name);
-        return XPKG_ERR_IO;
-    }
-
-    if (xpkg_db_register_package(&info) != XPKG_OK) {
-        fprintf(stderr, "xpkg: warning: files installed but database registration failed\n");
-        return XPKG_ERR_DB;
-    }
-
-    printf("xpkg: %s %s installed\n", info.name, info.version);
-    return XPKG_OK;
-}
-
-int xpkg_cmd_install(const char *file_path) {
-    return install_archive(file_path, INST_NONE) == XPKG_OK ? 0 : 1;
-}
-
-int xpkg_cmd_install_ex(const char *file_path, int skip_if_installed) {
-    return install_archive(file_path, skip_if_installed ? INST_SKIP_IF_INSTALLED : INST_NONE) == XPKG_OK ? 0 : 1;
-}
-
-/* Collect every file under srcdir (relative paths starting with "/") into
- * list (cap MAX_UPGRADE_FILES entries). Returns count. */
-static size_t collect_files(const char *srcdir, const char *rel, char list[][XPKG_MAX_PATH], size_t cap) {
-    DIR *d = opendir(srcdir);
-    if (!d) return 0;
-
-    size_t n = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL && n < cap) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        char src[XPKG_MAX_PATH], full[XPKG_MAX_PATH];
-        snprintf(src, sizeof(src), "%s/%s", srcdir, e->d_name);
-        snprintf(full, sizeof(full), "%s/%s", rel, e->d_name);
-
-        struct stat st;
-        if (lstat(src, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            n += collect_files(src, full, list + n, cap - n);
-        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
-            strncpy(list[n], full, XPKG_MAX_PATH - 1);
-            list[n][XPKG_MAX_PATH - 1] = '\0';
-            n++;
-        }
-    }
-    closedir(d);
-    return n;
-}
-
-static int path_in_list(const char *path, char list[][XPKG_MAX_PATH], size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        if (strcmp(list[i], path) == 0) return 1;
     }
     return 0;
 }
 
-int xpkg_cmd_upgrade_archive(const char *file_path) {
-    xpkg_db_init();
-
-    char scratch[XPKG_MAX_PATH];
-    scratch_path(scratch, sizeof(scratch));
-    mkdir(xpkg_cache_dir(), 0755);
-    rm_tree(scratch);
-    mkdir(scratch, 0755);
-
-    printf("xpkg: extracting %s\n", file_path);
-    if (xpkg_tar_extract(file_path, scratch) != XPKG_OK) {
-        fprintf(stderr, "xpkg: failed to extract %s\n", file_path);
-        return 1;
-    }
-
-    char pkginfo_path[XPKG_MAX_PATH];
-    snprintf(pkginfo_path, sizeof(pkginfo_path), "%s/pkg-info", scratch);
-
-    xpkg_info_t info;
-    if (xpkg_parse_pkginfo(pkginfo_path, &info) != XPKG_OK) {
-        fprintf(stderr, "xpkg: %s has no valid pkg-info\n", file_path);
-        return 1;
-    }
-
-    {
-        const char *root = xpkg_root();
-        if (root[0]) mkdir(root, 0755);
-    }
-
-    int installed;
-    xpkg_db_is_installed(info.name, &installed);
-    if (!installed) {
-        fprintf(stderr, "xpkg: %s is not installed; install it first\n", info.name);
-        return 1;
-    }
-
-    char oldver[XPKG_MAX_VERSION] = {0};
-    xpkg_db_get_version(info.name, oldver, sizeof(oldver));
-    if (xpkg_version_cmp(info.version, oldver) <= 0) {
-        printf("xpkg: %s %s is already up to date (installed %s)\n",
-               info.name, info.version, oldver);
+static int plan_name(const char *name, int explicit_, int reinstall, int need_index) {
+    int at = plan_find(name);
+    if (at >= 0) {
+        if (explicit_) g_plan[at].explicit_ = 1;
         return 0;
     }
-
-    /* Snapshot the old file set before we touch anything. Heap: 8192 paths
-     * x 4096 bytes x 2 sets is 64MB, which would overflow the stack. */
-    char (*old_paths)[XPKG_MAX_PATH] = malloc(MAX_UPGRADE_FILES * XPKG_MAX_PATH);
-    char (*new_paths)[XPKG_MAX_PATH] = malloc(MAX_UPGRADE_FILES * XPKG_MAX_PATH);
-    if (!old_paths || !new_paths) {
-        fprintf(stderr, "xpkg: out of memory during upgrade\n");
-        free(old_paths);
-        free(new_paths);
-        return 1;
-    }
-    size_t nold = 0;
-    {
-        sqlite3 *db;
-        if (sqlite3_open(xpkg_db_path(), &db) != SQLITE_OK) {
-            fprintf(stderr, "xpkg: cannot open database\n");
-            return 1;
+    xpkg_pkg_row_t row;
+    int inst = xpkg_db_is_installed(name) && xpkg_db_get(name, &row);
+    if (inst && !reinstall) {
+        if (explicit_) {
+            if (!row.explicit_ && !xpkg_opts.dry_run) xpkg_db_set_explicit(name, 1);
+            printf("  %s %s is already installed\n", name, row.version);
         }
-        sqlite3_stmt *stmt;
-        const char *sql = "SELECT path FROM files WHERE package_name = ? ORDER BY path;";
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, info.name, -1, SQLITE_STATIC);
-            while (nold < MAX_UPGRADE_FILES && sqlite3_step(stmt) == SQLITE_ROW) {
-                const char *p = (const char *)sqlite3_column_text(stmt, 0);
-                if (p) {
-                    strncpy(old_paths[nold], p, XPKG_MAX_PATH - 1);
-                    old_paths[nold][XPKG_MAX_PATH - 1] = '\0';
-                    nold++;
-                }
-            }
-            sqlite3_finalize(stmt);
-        }
-        sqlite3_close(db);
+        return 0;
     }
-
-    printf("xpkg: upgrading %s %s -> %s\n", info.name, oldver, info.version);
-
-    char files_dir[XPKG_MAX_PATH];
-    snprintf(files_dir, sizeof(files_dir), "%s/files", scratch);
-
-    /* New file set, for stale-file removal. */
-    size_t nnew = collect_files(files_dir, "", new_paths, MAX_UPGRADE_FILES);
-
-    /* Drop old DB rows, copy new files (overwriting), then remove stale. */
-    xpkg_db_clear_files(info.name);
-
-    if (copy_tree(files_dir, "", info.name) != XPKG_OK) {
-        fprintf(stderr, "xpkg: failed while copying files for %s\n", info.name);
-        free(old_paths);
-        free(new_paths);
-        return 1;
+    (void)need_index;
+    const xpkg_entry_t *e = xpkg_index_find(name);
+    if (!e) {
+        xpkg_err("no package named '%s' in the repositories (try: xpkg search %s)", name, name);
+        return -1;
     }
-
-    for (size_t i = 0; i < nold; i++) {
-        if (path_in_list(old_paths[i], new_paths, nnew)) continue;
-        printf("  removing %s\n", old_paths[i]);
-        char full[XPKG_MAX_PATH];
-        snprintf(full, sizeof(full), "%s%s", xpkg_root(), old_paths[i]);
-        remove(full);
+    if (g_nplan >= MAX_PLAN || g_nvisiting >= MAX_PLAN) {
+        xpkg_err("transaction too large");
+        return -1;
     }
-
-    if (xpkg_db_set_version(info.name, info.version) != XPKG_OK) {
-        fprintf(stderr, "xpkg: warning: version update failed for %s\n", info.name);
-        free(old_paths);
-        free(new_paths);
-        return 1;
+    snprintf(g_visiting[g_nvisiting++], XPKG_MAX_NAME, "%s", name);
+    int rc = 0;
+    if (e->has_depends) {
+        rc = plan_deps(name, (char (*)[XPKG_MAX_NAME])e->depends, e->depends_count);
+    } else {
+        /* index without depends: read them from the archive */
+        char path[XPKG_MAX_PATH];
+        xpkg_info_t info;
+        if (xpkg_fetch_entry(e, path, sizeof(path)) != XPKG_OK ||
+            xpkg_pkginfo_from_archive(path, &info) != XPKG_OK) rc = -1;
+        else rc = plan_deps(name, info.depends, info.depends_count);
     }
-
-    free(old_paths);
-    free(new_paths);
-
-    printf("xpkg: %s %s installed\n", info.name, info.version);
+    g_nvisiting--;
+    if (rc != 0) return rc;
+    step_t *s = &g_plan[g_nplan++];
+    memset(s, 0, sizeof(*s));
+    s->e = e;
+    s->explicit_ = explicit_;
+    s->allow_same = reinstall;
     return 0;
+}
+
+static int looks_like_file(const char *s) {
+    size_t l = strlen(s);
+    return strchr(s, '/') || (l > 5 && !strcmp(s + l - 5, ".xpkg"));
+}
+
+/* Puts every step after the steps it depends on (local archives are added
+ * in command-line order, which need not be dependency order). */
+static int order_plan(void) {
+    static step_t sorted[MAX_PLAN];
+    static char placed[MAX_PLAN];
+    memset(placed, 0, sizeof(placed));
+    int n = 0;
+    while (n < g_nplan) {
+        int progress = 0;
+        for (int i = 0; i < g_nplan; i++) {
+            if (placed[i]) continue;
+            const step_t *s = &g_plan[i];
+            int ndeps = s->e ? s->e->depends_count : s->linfo->depends_count;
+            int ready = 1;
+            for (int d = 0; d < ndeps && ready; d++) {
+                char dep[XPKG_MAX_NAME];
+                xpkg_dep_name(s->e ? s->e->depends[d] : s->linfo->depends[d], dep, sizeof(dep));
+                int at = plan_find(dep);
+                if (at >= 0 && at != i && !placed[at]) ready = 0;
+            }
+            if (!ready) continue;
+            sorted[n++] = *s;
+            placed[i] = 1;
+            progress = 1;
+        }
+        if (!progress) {
+            xpkg_err("dependency cycle among the packages to install");
+            return -1;
+        }
+    }
+    memcpy(g_plan, sorted, (size_t)n * sizeof(*sorted));
+    return 0;
+}
+
+static int run_plan(void) {
+    if (g_nplan && order_plan() != 0) return 1;
+    if (g_nplan == 0) {
+        if (!xpkg_opts.quiet) printf("nothing to do\n");
+        return 0;
+    }
+    unsigned long long dl = 0;
+    printf("\n%sPackages (%d):%s", xpkg_color("\033[1m"), g_nplan, xpkg_color("\033[0m"));
+    for (int i = 0; i < g_nplan; i++) {
+        if (g_plan[i].e) {
+            printf(" %s-%s", g_plan[i].e->name, g_plan[i].e->version);
+            dl += g_plan[i].e->size;
+        } else {
+            printf(" %s-%s", g_plan[i].linfo->name, g_plan[i].linfo->version);
+        }
+    }
+    char hs[32];
+    xpkg_human_size(dl, hs, sizeof(hs));
+    printf("\n%sDownload size:%s %s\n\n", xpkg_color("\033[1m"), xpkg_color("\033[0m"), hs);
+    if (xpkg_opts.dry_run) return 0;
+
+    xpkg_msg("downloading");
+    for (int i = 0; i < g_nplan; i++) {
+        step_t *s = &g_plan[i];
+        if (s->local) { snprintf(s->archive, sizeof(s->archive), "%s", s->local); continue; }
+        if (xpkg_fetch_entry(s->e, s->archive, sizeof(s->archive)) != XPKG_OK) return 1;
+    }
+    xpkg_msg("installing");
+    int fails = 0;
+    for (int i = 0; i < g_nplan; i++) {
+        if (xpkg_deploy_archive(g_plan[i].archive, g_plan[i].explicit_, g_plan[i].allow_same) != XPKG_OK) {
+            fails++;
+            break;   /* later steps may depend on this one */
+        }
+    }
+    return fails ? 1 : 0;
+}
+
+static void plan_reset(void) {
+    for (int i = 0; i < g_nplan; i++) free(g_plan[i].linfo);
+    g_nplan = 0;
+    g_nvisiting = 0;
+}
+
+int xpkg_cmd_install(char **names, int n, int reinstall) {
+    if (xpkg_require_root() != 0 || xpkg_lock() != 0) return 1;
+    if (xpkg_db_open() != XPKG_OK) return 1;
+    plan_reset();
+
+    int need_index = 0;
+    for (int i = 0; i < n; i++) if (!looks_like_file(names[i])) need_index = 1;
+    int have_index = xpkg_index_load(need_index) == XPKG_OK;
+    if (need_index && !have_index) return 1;
+
+    int rc = 0;
+    /* local archives first, so they can satisfy each other's dependencies */
+    for (int i = 0; i < n && rc == 0; i++) {
+        if (!looks_like_file(names[i])) continue;
+        xpkg_info_t *info = malloc(sizeof(*info));
+        if (!info || xpkg_pkginfo_from_archive(names[i], info) != XPKG_OK) {
+            xpkg_err("%s is not a valid .xpkg package", names[i]);
+            free(info);
+            rc = 1;
+            break;
+        }
+        if (plan_find(info->name) >= 0) { free(info); continue; }
+        if (g_nplan >= MAX_PLAN) { free(info); xpkg_err("transaction too large"); rc = 1; break; }
+        step_t *s = &g_plan[g_nplan++];
+        memset(s, 0, sizeof(*s));
+        s->local = names[i];
+        s->linfo = info;
+        s->explicit_ = 1;
+        s->allow_same = reinstall;
+    }
+    int nlocal = g_nplan;
+    for (int i = 0; i < nlocal && rc == 0; i++) {
+        xpkg_info_t *info = g_plan[i].linfo;
+        for (int d = 0; d < info->depends_count && rc == 0; d++) {
+            char dep[XPKG_MAX_NAME];
+            xpkg_dep_name(info->depends[d], dep, sizeof(dep));
+            if (xpkg_db_is_installed(dep) || plan_find(dep) >= 0) continue;
+            if (!have_index) {
+                xpkg_err("%s needs %s (not installed, and no repository to fetch it from)", info->name, dep);
+                rc = 1;
+            } else if (plan_name(dep, 0, 0, 1) != 0) rc = 1;
+        }
+    }
+    for (int i = 0; i < n && rc == 0; i++) {
+        if (looks_like_file(names[i])) continue;
+        if (!xpkg_valid_name(names[i])) { xpkg_err("invalid package name '%s'", names[i]); rc = 1; break; }
+        if (plan_name(names[i], 1, reinstall, 1) != 0) rc = 1;
+    }
+    if (rc == 0) rc = run_plan();
+    plan_reset();
+    return rc;
+}
+
+typedef struct { char **names; int n; int rc; } up_ctx_t;
+
+static int want(up_ctx_t *c, const char *name) {
+    if (!c->n) return 1;
+    for (int i = 0; i < c->n; i++) if (!strcmp(c->names[i], name)) return 1;
+    return 0;
+}
+
+static int upgrade_cb(const xpkg_pkg_row_t *row, void *user) {
+    up_ctx_t *c = user;
+    if (!want(c, row->name)) return 0;
+    const xpkg_entry_t *e = xpkg_index_find(row->name);
+    if (!e || xpkg_version_cmp(e->version, row->version) <= 0) return 0;
+    if (plan_find(row->name) >= 0) return 0;
+    snprintf(g_visiting[g_nvisiting++], XPKG_MAX_NAME, "%s", row->name);
+    int rc = e->has_depends ? plan_deps(row->name, (char (*)[XPKG_MAX_NAME])e->depends, e->depends_count) : 0;
+    g_nvisiting--;
+    if (rc != 0) { c->rc = 1; return 1; }
+    if (g_nplan >= MAX_PLAN) { c->rc = 1; return 1; }
+    step_t *s = &g_plan[g_nplan++];
+    memset(s, 0, sizeof(*s));
+    s->e = e;
+    s->explicit_ = row->explicit_;
+    return 0;
+}
+
+int xpkg_cmd_upgrade(char **names, int n) {
+    if (xpkg_require_root() != 0 || xpkg_lock() != 0) return 1;
+    if (xpkg_db_open() != XPKG_OK) return 1;
+    if (!xpkg_opts.dry_run && xpkg_cmd_update() != 0)
+        xpkg_warn("some repositories could not be refreshed; using the cached indexes");
+    if (xpkg_index_load(1) != XPKG_OK) return 1;
+    for (int i = 0; i < n; i++)
+        if (!xpkg_db_is_installed(names[i])) { xpkg_err("%s is not installed", names[i]); return 1; }
+    plan_reset();
+    up_ctx_t c = { names, n, 0 };
+    xpkg_db_each_package(upgrade_cb, &c);
+    int rc = c.rc ? 1 : run_plan();
+    plan_reset();
+    return rc;
 }

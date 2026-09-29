@@ -39,29 +39,31 @@ static void split_depends(xpkg_info_t *out, const char *value) {
     buf[sizeof(buf) - 1] = '\0';
 
     out->depends_count = 0;
-    char *tok = strtok(buf, ",");
+    char *save = NULL;
+    char *tok = strtok_r(buf, ", ", &save);
     while (tok != NULL && out->depends_count < XPKG_MAX_DEPENDS) {
-        while (isspace((unsigned char)*tok)) tok++; /* skip leading space */
-        strncpy(out->depends[out->depends_count], tok, XPKG_MAX_NAME - 1);
-        out->depends[out->depends_count][XPKG_MAX_NAME - 1] = '\0';
-        out->depends_count++;
-        tok = strtok(NULL, ",");
+        if (*tok) {
+            snprintf(out->depends[out->depends_count], XPKG_MAX_NAME, "%s", tok);
+            out->depends_count++;
+        }
+        tok = strtok_r(NULL, ", ", &save);
     }
 }
 
 /* Core parser over an in-memory, NUL-terminated pkg-info document. */
-static xpkg_status_t parse_pkginfo_data(const char *data, xpkg_info_t *out) {
+xpkg_status_t xpkg_parse_pkginfo_data(const char *data, xpkg_info_t *out) {
     memset(out, 0, sizeof(*out));
     strncpy(out->arch, "x86_64", sizeof(out->arch) - 1); /* sensible default */
 
     char *buf = strdup(data);
     if (!buf) return XPKG_ERR_BAD_PKGINFO;
 
-    char *line = strtok(buf, "\n");
+    char *save = NULL;
+    char *line = strtok_r(buf, "\n", &save);
     while (line) {
         trim_newline(line);
         if (line[0] == '\0' || line[0] == '#') {
-            line = strtok(NULL, "\n");
+            line = strtok_r(NULL, "\n", &save);
             continue; /* blank line or comment */
         }
 
@@ -84,11 +86,11 @@ static xpkg_status_t parse_pkginfo_data(const char *data, xpkg_info_t *out) {
             }
             /* unknown keys: ignored on purpose, see file header comment */
         }
-        line = strtok(NULL, "\n");
+        line = strtok_r(NULL, "\n", &save);
     }
     free(buf);
 
-    if (out->name[0] == '\0' || out->version[0] == '\0') {
+    if (!xpkg_valid_name(out->name) || out->version[0] == '\0') {
         /* NAME and VERSION are the only truly required fields -- everything
          * else has a sane default or is optional. */
         return XPKG_ERR_BAD_PKGINFO;
@@ -122,7 +124,7 @@ xpkg_status_t xpkg_parse_pkginfo(const char *path, xpkg_info_t *out) {
         return XPKG_ERR_BAD_PKGINFO;
     }
 
-    xpkg_status_t st = parse_pkginfo_data(data, out);
+    xpkg_status_t st = xpkg_parse_pkginfo_data(data, out);
     free(data);
     return st;
 }
@@ -170,7 +172,7 @@ xpkg_status_t xpkg_pkginfo_from_archive(const char *archive_path, xpkg_info_t *o
             }
             buf[got] = '\0';
             gzclose(gz);
-            xpkg_status_t st = parse_pkginfo_data(buf, out);
+            xpkg_status_t st = xpkg_parse_pkginfo_data(buf, out);
             free(buf);
             return st;
         } else {
@@ -187,4 +189,10 @@ xpkg_status_t xpkg_pkginfo_from_archive(const char *archive_path, xpkg_info_t *o
 
     gzclose(gz);
     return XPKG_ERR_BAD_PKGINFO;
+}
+void xpkg_dep_name(const char *dep, char *out, size_t outsz) {
+    size_t n = strcspn(dep, "<>=");
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, dep, n);
+    out[n] = '\0';
 }

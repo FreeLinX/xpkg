@@ -1,128 +1,112 @@
-/* main.c - xpkg entry point: argument parsing and command dispatch.
- *
- * Command set:
- *     xpkg install <file.xpkg>    install from a local .xpkg file
- *     xpkg install <name>         fetch <name> (and its DEPENDS) from a repo
- *     xpkg remove <name>          remove an installed package
- *     xpkg list                   list installed packages
- *     xpkg info <name>            show details for an installed package
- *     xpkg files <name>           list files owned by an installed package
- *     xpkg verify <name>          re-hash installed files, report changes
- *     xpkg update                 refresh the cached repo index
- *     xpkg upgrade <name>         upgrade one installed package
- *     xpkg upgrade-all            upgrade every installed package with a newer
- *                                 version available in a repo
- *     xpkg repo add/remove/list   manage configured repos
- */
+/* main.c - xpkg command line. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "xpkg.h"
 
-static void usage(const char *argv0) {
-    fprintf(stderr,
-        "xpkg %s - FreeLinX package manager\n\n"
-        "Usage:\n"
-        "  %s install <file.xpkg>   Install from a local .xpkg file\n"
-        "  %s install <name>        Fetch and install <name> from a repo (deps auto)\n"
-        "  %s remove <name>         Remove an installed package\n"
-        "  %s list                  List installed packages\n"
-        "  %s info <name>           Show details for an installed package\n"
-        "  %s files <name>          List files owned by an installed package\n"
-        "  %s verify <name>         Re-hash installed files, report changes\n"
-        "  %s update                Refresh the cached repo indexes\n"
-        "  %s upgrade <name>        Upgrade one installed package\n"
-        "  %s upgrade-all           Upgrade all installed packages\n"
-        "  %s repo add <url>        Add a package repo\n"
-        "  %s repo remove <url>     Remove a package repo\n"
-        "  %s repo list             List configured repos\n",
-        XPKG_VERSION,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0);
-}
+xpkg_opts_t xpkg_opts;
 
-/* A "name" (repo fetch) has no path separators and no .xpkg suffix. */
-static int looks_like_name(const char *s) {
-    if (strchr(s, '/') || strchr(s, '\\')) {
-        return 0;
-    }
-    size_t len = strlen(s);
-    if (len >= 5 && strcmp(s + len - 5, ".xpkg") == 0) {
-        return 0;
-    }
-    return 1;
-}
-
-static int cmd_install(const char *arg) {
-    if (looks_like_name(arg)) {
-        return xpkg_cmd_install_repo(arg);
-    }
-    return xpkg_cmd_install(arg);
+static void usage(FILE *f) {
+    fprintf(f,
+        "xpkg %s - the FreeLinX package manager\n\n"
+        "Usage: xpkg [options] <command> [arguments]\n\n"
+        "Software\n"
+        "  search <word>            find packages by name or description\n"
+        "  show <name>              details of a package in the repositories\n"
+        "  install <name|file>...   install packages (and what they need)\n"
+        "  reinstall <name|file>... install again over the current version\n"
+        "  remove <name>...         remove packages\n"
+        "  autoremove               remove dependencies nothing needs any more\n"
+        "  update                   refresh the package indexes\n"
+        "  upgrade [name...]        refresh, then upgrade everything (or the names)\n"
+        "  outdated                 list packages with a newer version available\n\n"
+        "Installed packages\n"
+        "  list [-e]                installed packages (-e: only ones you asked for)\n"
+        "  info <name>              details of an installed package\n"
+        "  files <name>             files a package installed\n"
+        "  owns <path>              which package a file belongs to\n"
+        "  verify [name...]         check installed files against the database\n"
+        "  clean                    delete downloaded package files\n\n"
+        "Repositories\n"
+        "  repo list | repo add <url> | repo remove <url>\n\n"
+        "Options\n"
+        "  -n, --dry-run            show what would happen, change nothing\n"
+        "  -f, --force              override conflicts, dependency and downgrade checks\n"
+        "  -q, --quiet              less output      -v, --verbose   list every file\n"
+        "  -y, --yes                accepted for compatibility (xpkg never prompts)\n"
+        "  --root <dir>             manage the system mounted at <dir>\n"
+        "  --allow-unsigned         accept repositories without a valid signature\n"
+        "  --no-scripts             do not run package scripts\n"
+        "  -V, --version            print the version\n",
+        XPKG_VERSION);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        usage(argv[0]);
-        return 1;
-    }
+    char *args[1024];
+    int nargs = 0;
 
-    const char *cmd = argv[1];
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-n") || !strcmp(a, "--dry-run")) xpkg_opts.dry_run = 1;
+        else if (!strcmp(a, "-f") || !strcmp(a, "--force")) xpkg_opts.force = 1;
+        else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) xpkg_opts.quiet = 1;
+        else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) xpkg_opts.verbose = 1;
+        else if (!strcmp(a, "-y") || !strcmp(a, "--yes") || !strcmp(a, "--noconfirm")) {}
+        else if (!strcmp(a, "--allow-unsigned")) xpkg_opts.allow_unsigned = 1;
+        else if (!strcmp(a, "--no-scripts")) xpkg_opts.no_scripts = 1;
+        else if (!strcmp(a, "--root") && i + 1 < argc) setenv("XPKG_ROOT", argv[++i], 1);
+        else if (!strncmp(a, "--root=", 7)) setenv("XPKG_ROOT", a + 7, 1);
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help") || !strcmp(a, "help")) { usage(stdout); return 0; }
+        else if (!strcmp(a, "-V") || !strcmp(a, "--version")) { printf("xpkg %s\n", XPKG_VERSION); return 0; }
+        else if (!strcmp(a, "-e") && nargs == 1 && !strcmp(args[0], "list")) args[nargs++] = argv[i];
+        else if (a[0] == '-' && a[1]) { fprintf(stderr, "xpkg: unknown option %s\n", a); return 2; }
+        else if (nargs < 1024) args[nargs++] = argv[i];
+    }
+    if (nargs == 0) { usage(stderr); return 2; }
 
-    if (strcmp(cmd, "install") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return cmd_install(argv[2]);
-    }
-    if (strcmp(cmd, "remove") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return xpkg_cmd_remove(argv[2]);
-    }
-    if (strcmp(cmd, "list") == 0) {
-        return xpkg_cmd_list();
-    }
-    if (strcmp(cmd, "info") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return xpkg_cmd_info(argv[2]);
-    }
-    if (strcmp(cmd, "files") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return xpkg_cmd_files(argv[2]);
-    }
-    if (strcmp(cmd, "verify") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return xpkg_cmd_verify(argv[2]);
-    }
-    if (strcmp(cmd, "update") == 0) {
-        return xpkg_cmd_update();
-    }
-    if (strcmp(cmd, "upgrade") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        return xpkg_cmd_upgrade(argv[2]);
-    }
-    if (strcmp(cmd, "upgrade-all") == 0) {
-        return xpkg_cmd_upgrade_all();
-    }
-    if (strcmp(cmd, "repo") == 0) {
-        if (argc < 3) { usage(argv[0]); return 1; }
-        if (strcmp(argv[2], "add") == 0) {
-            if (argc < 4) { usage(argv[0]); return 1; }
-            return xpkg_cmd_repo_add(argv[3]);
-        }
-        if (strcmp(argv[2], "remove") == 0) {
-            if (argc < 4) { usage(argv[0]); return 1; }
-            return xpkg_cmd_repo_remove(argv[3]);
-        }
-        if (strcmp(argv[2], "list") == 0) {
-            return xpkg_cmd_repo_list();
-        }
-        fprintf(stderr, "xpkg: unknown repo subcommand: %s\n", argv[2]);
-        usage(argv[0]);
-        return 1;
-    }
-    if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
-        usage(argv[0]);
-        return 0;
-    }
+    const char *cmd = args[0];
+    char **rest = args + 1;
+    int nrest = nargs - 1;
+    int rc;
 
-    fprintf(stderr, "xpkg: unknown command: %s\n", cmd);
-    usage(argv[0]);
-    return 1;
+#define NEED(k) do { if (nrest < (k)) { fprintf(stderr, "xpkg: '%s' needs an argument (see xpkg --help)\n", cmd); return 2; } } while (0)
+
+    if (!strcmp(cmd, "install") || !strcmp(cmd, "add") || !strcmp(cmd, "in")) { NEED(1); rc = xpkg_cmd_install(rest, nrest, 0); }
+    else if (!strcmp(cmd, "reinstall")) { NEED(1); rc = xpkg_cmd_install(rest, nrest, 1); }
+    else if (!strcmp(cmd, "remove") || !strcmp(cmd, "rm") || !strcmp(cmd, "del")) { NEED(1); rc = xpkg_cmd_remove(rest, nrest); }
+    else if (!strcmp(cmd, "autoremove")) rc = xpkg_cmd_autoremove();
+    else if (!strcmp(cmd, "update")) {
+        if (xpkg_lock() != 0) return 1;
+        rc = xpkg_cmd_update();
+    }
+    else if (!strcmp(cmd, "upgrade") || !strcmp(cmd, "up")) rc = xpkg_cmd_upgrade(rest, nrest);
+    else if (!strcmp(cmd, "upgrade-all")) rc = xpkg_cmd_upgrade(NULL, 0);
+    else if (!strcmp(cmd, "outdated")) rc = xpkg_cmd_outdated();
+    else if (!strcmp(cmd, "search") || !strcmp(cmd, "find")) rc = xpkg_cmd_search(nrest ? rest[0] : "");
+    else if (!strcmp(cmd, "show")) { NEED(1); rc = xpkg_cmd_show(rest[0]); }
+    else if (!strcmp(cmd, "query")) rc = xpkg_cmd_query();
+    else if (!strcmp(cmd, "list") || !strcmp(cmd, "ls")) rc = xpkg_cmd_list(nrest && !strcmp(rest[0], "-e"));
+    else if (!strcmp(cmd, "info")) { NEED(1); rc = xpkg_cmd_info(rest[0]); }
+    else if (!strcmp(cmd, "files")) { NEED(1); rc = xpkg_cmd_files(rest[0]); }
+    else if (!strcmp(cmd, "owns")) { NEED(1); rc = xpkg_cmd_owns(rest[0]); }
+    else if (!strcmp(cmd, "verify")) rc = xpkg_cmd_verify(rest, nrest);
+    else if (!strcmp(cmd, "clean")) rc = xpkg_cmd_clean();
+    else if (!strcmp(cmd, "repo")) {
+        NEED(1);
+        if (!strcmp(rest[0], "list")) rc = xpkg_cmd_repo_list();
+        else if (!strcmp(rest[0], "add")) {
+            NEED(2);
+            if (xpkg_require_root() != 0) return 1;
+            rc = xpkg_cmd_repo_add(rest[1]);
+        } else if (!strcmp(rest[0], "remove") || !strcmp(rest[0], "rm")) {
+            NEED(2);
+            if (xpkg_require_root() != 0) return 1;
+            rc = xpkg_cmd_repo_remove(rest[1]);
+        } else { fprintf(stderr, "xpkg: unknown repo command %s\n", rest[0]); return 2; }
+    }
+    else { fprintf(stderr, "xpkg: unknown command '%s' (see xpkg --help)\n", cmd); return 2; }
+
+    xpkg_db_close();
+    xpkg_unlock();
+    return rc;
 }

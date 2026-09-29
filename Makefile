@@ -51,9 +51,9 @@ LDFLAGS = --target=$(FREELINX_TRIPLE) --sysroot=$(FREELINX_SYSROOT) \
           -L$(SQLITE_PREFIX)/lib
 LDLIBS  = -lsqlite3 -lz -lssl -lcrypto -lpthread -ldl
 
-SRCS = src/main.c src/pkginfo.c src/db.c src/tar.c src/hash.c \
-       src/paths.c src/version.c \
-       src/cmd_install.c src/cmd_other.c \
+SRCS = src/main.c src/util.c src/paths.c src/lock.c src/json.c src/sign.c \
+       src/pkginfo.c src/db.c src/tar.c src/hash.c src/version.c \
+       src/install.c src/cmd_install.c src/cmd_other.c \
        src/net.c src/repo.c
 OBJS = $(SRCS:.c=.o)
 BIN  = xpkg
@@ -84,3 +84,24 @@ $(BIN): $(OBJS)
 
 clean:
 	rm -f $(OBJS) $(BIN)
+
+# --- repository index integrity -------------------------------------------
+# `xpkg-create index` appends, so a rebuilt package keeps the previous build's
+# size/sha256 in the index and `xpkg install` then refuses it (it verifies the
+# sha256 after download).  Regenerate the index from the archives instead; see
+# the "Hosting the public repo" section of README.md.
+REPO_INDEX_PY   := tools/xpkg-repo-index.py
+REPO_DIR        ?= ../ports/packages
+PUBLISHED_BASE  ?= https://huggingface.co/datasets/FreeLinX/packages/resolve/main
+
+.PHONY: repo-index repo-check repo-check-repo
+
+repo-index:
+	@python3 $(REPO_INDEX_PY) --dir "$(REPO_DIR)" --regen
+
+repo-check:
+	@python3 $(REPO_INDEX_PY) --dir "$(REPO_DIR)" --check
+
+# Audits the live published repo: downloads every archive and re-hashes it.
+repo-check-repo:
+	@python3 $(REPO_INDEX_PY) --base "$(PUBLISHED_BASE)" --check -v

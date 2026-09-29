@@ -1,387 +1,358 @@
-/* repo.c - repo index, update, dependency resolution, and package fetching.
+/* repo.c - repositories: index download, signature policy, lookups.
  *
- * A repo is a directory of *.xpkg files plus an index.json, served over
- * HTTP(S). repos.conf (config dir /repos.conf) lists one base repo URL per
- * line; each line's index.json is at <url>/index.json and each package's
- * archive at <url>/<file> (the "file" field of its index entry).
+ * A repo is a URL serving index.json, index.json.sig and the archives:
  *
- * index.json layout (written by tools/xpkg-create.c):
- *   { "packages": { "<name>": {
- *     "version": "1.0", "description": "...", "arch": "x86_64",
- *     "file": "<name>-<ver>.xpkg", "size": 12345, "sha256": "<hex>"
- *   } } }
+ *   { "generated": 1790000000,
+ *     "packages": { "<name>": { "version": "1.0", "description": "...",
+ *         "arch": "x86_64", "file": "<name>-1.0.xpkg", "size": 123,
+ *         "sha256": "<hex>", "depends": ["a", "b"] } } }
  *
- * Freshness model:
- *   - `xpkg update` fetches each repo's index.json into the cache dir
- *     (<cache>/idx/<repo>.index.json) and reports what changed vs the
- *     previous cached copy.
- *   - install/upgrade read the cached index if present (so they work after
- *     a single `xpkg update`), otherwise fetch a fresh one on first use.
+ * Trust: when any key is installed in /etc/xpkg/keys, every index must carry
+ * a valid Ed25519 signature by one of them (--allow-unsigned overrides).
+ * The signature covers the whole index, and the index pins every archive's
+ * size and sha256, so nothing unsigned is ever installed.  `generated`
+ * must not go backwards between updates, which stops a mirror from
+ * replaying an old signed index to hold back security fixes.
  *
- * Dependencies:
- *   index.json carries no depends field; a package's DEPENDS lives in the
- *   pkg-info file inside its .xpkg archive. The resolver downloads the
- *   archives involved, reads their pkg-info (xpkg_pkginfo_from_archive),
- *   and works out a dependency-first install order, detecting cycles.
+ * Repos are consulted in repos.conf order; the first one that lists a
+ * name provides it.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "xpkg.h"
 
-#define REPO_MAX_LINE XPKG_MAX_LINE
 #define MAX_REPOS 32
-#define MAX_PKGNAMES 2048
-#define MAX_RESOLVED 256
 
-typedef struct {
-    char name[XPKG_MAX_NAME];
-    char version[XPKG_MAX_VERSION];
-    char file[XPKG_MAX_PATH];
-    char sha[65];
-    char repo[XPKG_MAX_PATH];
-} pkg_entry_t;
+static char g_repos[MAX_REPOS][XPKG_MAX_PATH];
+static int g_nrepos = -1;
+static xpkg_entry_t *g_idx;
+static int g_nidx, g_capidx;
+static int g_loaded;
 
-/* --- repos.conf -------------------------------------------------------- */
+/* --- repos.conf ----------------------------------------------------------- */
 
-static int repos_load(char repos[][XPKG_MAX_PATH], int max) {
+static void repos_load(void) {
+    if (g_nrepos >= 0) return;
+    g_nrepos = 0;
     FILE *f = fopen(xpkg_repos_conf(), "r");
-    int n = 0;
-    if (!f) {
-        return 0;
-    }
-    char line[REPO_MAX_LINE];
-    while (n < max && fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0' || *p == '#') continue;
-        size_t len = strlen(p);
-        while (len > 0 && (p[len - 1] == '/' || p[len - 1] == ' ' || p[len - 1] == '\t')) {
-            p[--len] = '\0';
-        }
-        if (len > 0) {
-            strncpy(repos[n], p, XPKG_MAX_PATH - 1);
-            repos[n][XPKG_MAX_PATH - 1] = '\0';
-            n++;
-        }
-    }
-    fclose(f);
-    return n;
-}
-
-static void repos_save(char repos[][XPKG_MAX_PATH], int n) {
-    mkdir(xpkg_config_dir(), 0755);
-    FILE *f = fopen(xpkg_repos_conf(), "w");
     if (!f) return;
-    for (int i = 0; i < n; i++) {
-        fprintf(f, "%s\n", repos[i]);
+    char line[XPKG_MAX_PATH];
+    while (g_nrepos < MAX_REPOS && fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        size_t l = strlen(p);
+        while (l > 0 && (isspace((unsigned char)p[l - 1]) || p[l - 1] == '/')) p[--l] = '\0';
+        if (!*p || *p == '#') continue;
+        snprintf(g_repos[g_nrepos++], XPKG_MAX_PATH, "%s", p);
     }
     fclose(f);
 }
 
-/* --- tiny JSON helpers --------------------------------------------------- */
-
-/* Reads an entire file into a malloc'd NUL-terminated buffer (or NULL). */
-static char *read_file(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    long sz;
-    fseek(f, 0, SEEK_END);
-    sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc((size_t)sz + 1);
-    if (buf) {
-        size_t got = fread(buf, 1, (size_t)sz, f);
-        buf[got] = '\0';
-    }
-    fclose(f);
-    return buf;
+static int repos_save(void) {
+    if (xpkg_mkdir_p(xpkg_config_dir(), 0755) != 0) return -1;
+    char *buf = malloc((size_t)(g_nrepos + 2) * XPKG_MAX_PATH);
+    if (!buf) return -1;
+    size_t o = (size_t)sprintf(buf, "# xpkg repositories, one URL per line, highest priority first\n");
+    for (int i = 0; i < g_nrepos; i++) o += (size_t)sprintf(buf + o, "%s\n", g_repos[i]);
+    int r = xpkg_write_file_atomic(xpkg_repos_conf(), buf, o);
+    free(buf);
+    return r;
 }
 
-/* Given a buffer containing index.json, find the value of a package field.
- * `name` is the package key; `field` the field key. Returns the field value
- * (may be empty) in out. Handles the specific flat structure xpkg-create
- * emits, without pulling in a full JSON library. */
-static int json_pkg_field(const char *json, const char *name,
-                          const char *field, char *out, size_t outsz) {
-    out[0] = '\0';
-    char keypat[256];
-    snprintf(keypat, sizeof(keypat), "\"%s\"", name);
-    const char *pk = strstr(json, keypat);
-    if (!pk) return -1;
-    const char *brace = strchr(pk, '{');
-    if (!brace) return -1;
-    const char *end = strchr(brace, '}');
-    if (!end) return -1;
+int xpkg_repos_count(void) { repos_load(); return g_nrepos; }
+const char *xpkg_repo_url(int i) { repos_load(); return (i >= 0 && i < g_nrepos) ? g_repos[i] : ""; }
 
-    char fpat[128];
-    snprintf(fpat, sizeof(fpat), "\"%s\"", field);
-    char fk[128];
-    snprintf(fk, sizeof(fk), "%s", fpat);
-
-    const char *pos = brace;
-    while (pos < end) {
-        const char *f = strstr(pos, fpat);
-        if (!f || f >= end) break;
-        if (strncmp(f, fk, strlen(fk)) != 0) { pos = f + strlen(fpat); continue; }
-        const char *colon = f + strlen(fpat);
-        while (colon < end && *colon != ':' && *colon != '}') colon++;
-        if (colon < end && *colon == ':') {
-            colon++;
-            while (colon < end && isspace((unsigned char)*colon)) colon++;
-            if (colon < end && *colon == '"') {
-                colon++;
-                const char *vstart = colon;
-                while (colon < end && *colon != '"') colon++;
-                size_t len = (size_t)(colon - vstart);
-                if (len >= outsz) len = outsz - 1;
-                memcpy(out, vstart, len);
-                out[len] = '\0';
-                return 0;
-            } else {
-                const char *vstart = colon;
-                while (colon < end && *colon != ',' && *colon != '}' && *colon != '\n') colon++;
-                size_t len = (size_t)(colon - vstart);
-                if (len >= outsz) len = outsz - 1;
-                memcpy(out, vstart, len);
-                out[len] = '\0';
-                return 0;
-            }
-        }
-        pos = f + strlen(fpat);
-    }
-    return -1;
-}
-
-/* Collect every package key from an index.json buffer into names[]. */
-static int json_name_list(const char *buf, char names[][XPKG_MAX_NAME], int max) {
-    int n = 0;
-    const char *line = buf;
-    while (*line) {
-        const char *nl = strchr(line, '\n');
-        size_t len = nl ? (size_t)(nl - line) : strlen(line);
-
-        const char *p = line;
-        while (p < line + len && *p == ' ') p++;
-        if (p < line + len && *p == '"') {
-            const char *k = p + 1;
-            const char *ke = k;
-            while (ke < line + len && *ke && *ke != '"') ke++;
-            if (ke < line + len && ke + 1 < line + len && ke[1] == ':') {
-                const char *after = ke + 1;
-                while (after < line + len && (*after == ' ' || *after == ':')) after++;
-                if (after < line + len && *after == '{') {
-                    size_t kl = (size_t)(ke - k);
-                    if (kl > 0 && kl < XPKG_MAX_NAME && n < max &&
-                        !(kl == 8 && memcmp(k, "packages", 8) == 0)) {
-                        memcpy(names[n], k, kl);
-                        names[n][kl] = '\0';
-                        n++;
-                    }
-                }
-            }
-        }
-        if (!nl) break;
-        line = nl + 1;
-    }
-    return n;
-}
-
-/* --- cache layout -------------------------------------------------------- */
-
-/* Map an arbitrary repo URL to a safe cache token (letters/digits/_ ). */
-static void cache_token(const char *repo, char *out, size_t n) {
+static void repo_token(const char *url, char *out, size_t n) {
     size_t j = 0;
-    for (const char *p = repo; *p && j + 2 < n; p++) {
-        char c = *p;
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-            out[j++] = c;
-        } else {
-            out[j++] = '_';
-        }
-    }
+    for (const char *p = url; *p && j + 1 < n; p++)
+        out[j++] = isalnum((unsigned char)*p) ? *p : '_';
     out[j] = '\0';
 }
 
-static void repo_index_cache_path(const char *repo, char *out, size_t n) {
+static void idx_paths(const char *url, char *idx, char *sig, size_t n) {
     char tok[XPKG_MAX_PATH];
-    cache_token(repo, tok, sizeof(tok));
-    snprintf(out, n, "%s/idx/%s.index.json", xpkg_cache_dir(), tok);
+    repo_token(url, tok, sizeof(tok));
+    snprintf(idx, n, "%s/idx/%s.index.json", xpkg_cache_dir(), tok);
+    snprintf(sig, n, "%s/idx/%s.index.json.sig", xpkg_cache_dir(), tok);
 }
 
-static void repo_pkg_cache_dir(const char *repo, char *out, size_t n) {
-    char tok[XPKG_MAX_PATH];
-    cache_token(repo, tok, sizeof(tok));
-    snprintf(out, n, "%s/%s", xpkg_cache_dir(), tok);
-}
+/* --- signature policy --------------------------------------------------- */
 
-/* Return the index.json for a repo: use the cached copy if present (install
- * honours the last `xpkg update`), otherwise fetch one now and cache it. */
-static char *repo_get_index(const char *repo) {
-    char path[XPKG_MAX_PATH];
-    repo_index_cache_path(repo, path, sizeof(path));
-
-    char *buf = read_file(path);
-    if (!buf) {
-        mkdir(xpkg_cache_dir(), 0755);
-        char idxdir[XPKG_MAX_PATH];
-        snprintf(idxdir, sizeof(idxdir), "%s/idx", xpkg_cache_dir());
-        mkdir(idxdir, 0755);
-
-        char url[XPKG_MAX_PATH];
-        snprintf(url, sizeof(url), "%s/index.json", repo);
-        if (xpkg_net_get(url, path) == XPKG_OK) {
-            buf = read_file(path);
-        }
+static xpkg_status_t check_signature(const char *url, const char *data, size_t len, const char *sig) {
+    if (!xpkg_have_keys()) {
+        static int warned;
+        if (!warned && !xpkg_opts.allow_unsigned)
+            xpkg_warn("no trusted keys in %s: repository signatures are not checked", xpkg_keys_dir());
+        warned = 1;
+        return XPKG_OK;
     }
-    return buf;
+    if (!sig) {
+        if (xpkg_opts.allow_unsigned) {
+            xpkg_warn("%s is not signed (accepted: --allow-unsigned)", url);
+            return XPKG_OK;
+        }
+        xpkg_err("%s has no index signature; refusing it (use --allow-unsigned to override)", url);
+        return XPKG_ERR_SIGNATURE;
+    }
+    char key[128];
+    xpkg_status_t st = xpkg_verify_signature(data, len, sig, key, sizeof(key));
+    if (st == XPKG_OK) return XPKG_OK;
+    if (xpkg_opts.allow_unsigned) {
+        xpkg_warn("bad signature on %s (accepted: --allow-unsigned)", url);
+        return XPKG_OK;
+    }
+    xpkg_err("BAD SIGNATURE on the index of %s: it was not signed by a trusted key", url);
+    return XPKG_ERR_SIGNATURE;
 }
 
-/* Download (or reuse) a repo package archive, verifying the index sha256.
- * The resolved local path is returned in out_path. */
-static int fetch_pkg_archive(pkg_entry_t *e, char *out_path, size_t n) {
+/* --- index parsing -------------------------------------------------------- */
+
+static void idx_free(void) {
+    for (int i = 0; i < g_nidx; i++) free(g_idx[i].description);
+    free(g_idx);
+    g_idx = NULL;
+    g_nidx = g_capidx = 0;
+    g_loaded = 0;
+}
+
+const xpkg_entry_t *xpkg_index_find(const char *name) {
+    for (int i = 0; i < g_nidx; i++)
+        if (!strcmp(g_idx[i].name, name)) return &g_idx[i];
+    return NULL;
+}
+
+int xpkg_index_count(void) { return g_nidx; }
+const xpkg_entry_t *xpkg_index_at(int i) { return (i >= 0 && i < g_nidx) ? &g_idx[i] : NULL; }
+
+static int valid_file_name(const char *f) {
+    return f[0] && f[0] != '.' && !strchr(f, '/') && !strchr(f, '\\') && strlen(f) < 256;
+}
+
+static int valid_sha(const char *s) {
+    if (strlen(s) != 64) return 0;
+    for (; *s; s++) if (!isxdigit((unsigned char)*s)) return 0;
+    return 1;
+}
+
+static int add_entries(int repo, const json_t *doc) {
+    const json_t *pk = json_get(doc, "packages");
+    if (!pk || pk->type != JSON_OBJ) return -1;
+    for (const json_t *p = pk->child; p; p = p->next) {
+        if (p->type != JSON_OBJ || !xpkg_valid_name(p->key)) continue;
+        if (xpkg_index_find(p->key)) continue;   /* earlier repo wins */
+        const char *file = json_str(p, "file", ""), *sha = json_str(p, "sha256", "");
+        if (!valid_file_name(file) || !valid_sha(sha)) {
+            xpkg_warn("%s: ignoring malformed index entry %s", g_repos[repo], p->key);
+            continue;
+        }
+        if (g_nidx == g_capidx) {
+            int nc = g_capidx ? g_capidx * 2 : 512;
+            xpkg_entry_t *n = realloc(g_idx, (size_t)nc * sizeof(*n));
+            if (!n) return -1;
+            g_idx = n;
+            g_capidx = nc;
+        }
+        xpkg_entry_t *e = &g_idx[g_nidx];
+        memset(e, 0, sizeof(*e));
+        snprintf(e->name, sizeof(e->name), "%s", p->key);
+        snprintf(e->version, sizeof(e->version), "%s", json_str(p, "version", "0"));
+        e->description = strdup(json_str(p, "description", ""));
+        snprintf(e->arch, sizeof(e->arch), "%s", json_str(p, "arch", "x86_64"));
+        snprintf(e->file, sizeof(e->file), "%s", file);
+        snprintf(e->sha, sizeof(e->sha), "%s", sha);
+        for (char *c = e->sha; *c; c++) *c = (char)tolower((unsigned char)*c);
+        e->size = (unsigned long long)json_num(p, "size", 0);
+        const json_t *deps = json_get(p, "depends");
+        if (deps && deps->type == JSON_ARR) {
+            e->has_depends = 1;
+            for (const json_t *d = deps->child; d && e->depends_count < XPKG_MAX_DEPENDS; d = d->next)
+                if (d->type == JSON_STR && d->str[0])
+                    snprintf(e->depends[e->depends_count++], XPKG_MAX_NAME, "%s", d->str);
+        } else if (deps && deps->type == JSON_STR) {
+            xpkg_info_t tmp;
+            char line[XPKG_MAX_LINE + 16];
+            snprintf(line, sizeof(line), "NAME=x\nVERSION=0\nDEPENDS=%s\n", deps->str);
+            if (xpkg_parse_pkginfo_data(line, &tmp) == XPKG_OK) {
+                e->has_depends = 1;
+                e->depends_count = tmp.depends_count;
+                memcpy(e->depends, tmp.depends, sizeof(e->depends));
+            }
+        }
+        e->repo = repo;
+        g_nidx++;
+    }
+    return 0;
+}
+
+static int arch_ok(const char *a) {
+    return !a[0] || !strcmp(a, "x86_64") || !strcmp(a, "any") || !strcmp(a, "noarch");
+}
+
+/* Downloads one repo's index + signature into the cache, verified. */
+static xpkg_status_t update_repo(int r, int *added, int *changed, int *removed) {
+    const char *url = g_repos[r];
+    char idx[XPKG_MAX_PATH], sig[XPKG_MAX_PATH], tidx[XPKG_MAX_PATH], tsig[XPKG_MAX_PATH];
+    idx_paths(url, idx, sig, sizeof(idx));
+    snprintf(tidx, sizeof(tidx), "%s.new", idx);
+    snprintf(tsig, sizeof(tsig), "%s.new", sig);
     char dir[XPKG_MAX_PATH];
-    repo_pkg_cache_dir(e->repo, dir, sizeof(dir));
-    mkdir(dir, 0755);
-
-    snprintf(out_path, n, "%s/%s", dir, e->file);
-    if (access(out_path, R_OK) == 0) {
-        return 0;
-    }
-
-    char url[XPKG_MAX_PATH];
-    snprintf(url, sizeof(url), "%s/%s", e->repo, e->file);
-    printf("xpkg: fetching %s\n", url);
-    if (xpkg_net_get(url, out_path) != XPKG_OK) {
-        fprintf(stderr, "xpkg: failed to download %s\n", url);
-        return 1;
-    }
-    if (e->sha[0]) {
-        char actual[65];
-        if (xpkg_sha256_file(out_path, actual) == XPKG_OK &&
-            strcasecmp(actual, e->sha) != 0) {
-            fprintf(stderr, "xpkg: sha256 mismatch for %s\n", e->file);
-            unlink(out_path);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Find the first (in repos.conf order) repo that lists `name`. */
-static int repo_find(const char *name, pkg_entry_t *out) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int n = repos_load(repos, MAX_REPOS);
-
-    for (int i = 0; i < n; i++) {
-        char *buf = repo_get_index(repos[i]);
-        if (!buf) continue;
-
-        char f[XPKG_MAX_PATH], v[XPKG_MAX_VERSION], s[65];
-        if (json_pkg_field(buf, name, "file", f, sizeof(f)) == 0) {
-            strncpy(out->name, name, sizeof(out->name) - 1);
-            json_pkg_field(buf, name, "version", v, sizeof(v));
-            json_pkg_field(buf, name, "sha256", s, sizeof(s));
-            strncpy(out->version, v, sizeof(out->version) - 1);
-            strncpy(out->file, f, sizeof(out->file) - 1);
-            strncpy(out->sha, s, sizeof(out->sha) - 1);
-            strncpy(out->repo, repos[i], sizeof(out->repo) - 1);
-            out->name[sizeof(out->name) - 1] = '\0';
-            out->version[sizeof(out->version) - 1] = '\0';
-            out->file[sizeof(out->file) - 1] = '\0';
-            out->sha[sizeof(out->sha) - 1] = '\0';
-            out->repo[sizeof(out->repo) - 1] = '\0';
-            free(buf);
-            return 1;
-        }
-        free(buf);
-    }
-    return 0;
-}
-
-/* --- dependency resolver ------------------------------------------------ */
-
-static pkg_entry_t g_resolved[MAX_RESOLVED];
-static char g_archive[MAX_RESOLVED][XPKG_MAX_PATH];
-static int g_rstate[MAX_RESOLVED];     /* 0 new, 1 visiting, 2 done */
-static int g_nresolved;
-static char g_order[MAX_RESOLVED][XPKG_MAX_NAME];
-static int g_norder;
-
-static void resolver_reset(void) {
-    memset(g_resolved, 0, sizeof(g_resolved));
-    memset(g_archive, 0, sizeof(g_archive));
-    memset(g_rstate, 0, sizeof(g_rstate));
-    memset(g_order, 0, sizeof(g_order));
-    g_nresolved = 0;
-    g_norder = 0;
-}
-
-static int resolver_find(const char *name) {
-    for (int i = 0; i < g_nresolved; i++) {
-        if (strcmp(g_resolved[i].name, name) == 0) return i;
-    }
-    return -1;
-}
-
-/* Depth-first resolve of `name` and its not-yet-installed dependencies.
- * g_order ends up in dependency-first install order. */
-static xpkg_status_t resolve_name(const char *name) {
-    int idx = resolver_find(name);
-    if (idx >= 0) {
-        if (g_rstate[idx] == 1) {
-            fprintf(stderr, "xpkg: dependency cycle detected involving: %s\n", name);
-            return XPKG_ERR_CYCLE;
-        }
-        return XPKG_OK; /* already fully resolved */
-    }
-    if (g_nresolved >= MAX_RESOLVED) {
-        fprintf(stderr, "xpkg: dependency graph too deep (limit %d)\n", MAX_RESOLVED);
+    snprintf(dir, sizeof(dir), "%s/idx", xpkg_cache_dir());
+    if (xpkg_mkdir_p(dir, 0755) != 0) {
+        xpkg_err("cannot create %s: %s", dir, strerror(errno));
         return XPKG_ERR_IO;
     }
 
-    pkg_entry_t e;
-    if (!repo_find(name, &e)) {
-        fprintf(stderr, "xpkg: package not found in any repository: %s\n", name);
-        return XPKG_ERR_NOT_FOUND;
-    }
-
-    idx = g_nresolved++;
-    g_resolved[idx] = e;
-    g_rstate[idx] = 1;
-
-    char arch[XPKG_MAX_PATH];
-    if (fetch_pkg_archive(&g_resolved[idx], arch, sizeof(arch)) != 0) {
+    char u[XPKG_MAX_URL];
+    snprintf(u, sizeof(u), "%s/index.json", url);
+    if (xpkg_net_get(u, tidx, NULL) != XPKG_OK) {
+        xpkg_err("cannot fetch the index of %s", url);
         return XPKG_ERR_IO;
     }
-    strncpy(g_archive[idx], arch, sizeof(g_archive[idx]) - 1);
-    g_archive[idx][sizeof(g_archive[idx]) - 1] = '\0';
+    snprintf(u, sizeof(u), "%s/index.json.sig", url);
+    xpkg_net_quiet_404 = 1;
+    int have_sig = xpkg_net_get(u, tsig, NULL) == XPKG_OK;
+    xpkg_net_quiet_404 = 0;
+    if (!have_sig) unlink(tsig);
 
-    xpkg_info_t info;
-    if (xpkg_pkginfo_from_archive(arch, &info) != XPKG_OK) {
-        fprintf(stderr, "xpkg: cannot read package metadata from %s\n", arch);
+    size_t len = 0;
+    char *data = xpkg_read_file(tidx, &len);
+    char *sigtext = have_sig ? xpkg_read_file(tsig, NULL) : NULL;
+    xpkg_status_t st = data ? check_signature(url, data, len, sigtext) : XPKG_ERR_IO;
+    char perr[128];
+    json_t *doc = NULL;
+    if (st == XPKG_OK) {
+        doc = json_parse(data, perr, sizeof(perr));
+        if (!doc || !json_get(doc, "packages")) {
+            xpkg_err("%s: index is not valid (%s)", url, doc ? "no packages" : perr);
+            st = XPKG_ERR_BAD_ARCHIVE;
+        }
+    }
+
+    /* anti-rollback + change report against the previous cache */
+    char *olddata = xpkg_read_file(idx, NULL);
+    json_t *old = olddata ? json_parse(olddata, perr, sizeof(perr)) : NULL;
+    if (st == XPKG_OK && old) {
+        double og = json_num(old, "generated", 0), ng = json_num(doc, "generated", 0);
+        if (ng < og && !xpkg_opts.force) {
+            xpkg_err("%s: index is older than the one already cached (possible replay); "
+                     "use --force to accept it", url);
+            st = XPKG_ERR_SIGNATURE;
+        }
+    }
+    if (st == XPKG_OK) {
+        const json_t *np = json_get(doc, "packages");
+        const json_t *op = old ? json_get(old, "packages") : NULL;
+        for (const json_t *p = np->child; p; p = p->next) {
+            const json_t *o = op ? json_get(op, p->key) : NULL;
+            if (!o) (*added)++;
+            else if (strcmp(json_str(o, "version", ""), json_str(p, "version", "")) ||
+                     strcmp(json_str(o, "sha256", ""), json_str(p, "sha256", "")))
+                (*changed)++;
+        }
+        if (op)
+            for (const json_t *p = op->child; p; p = p->next)
+                if (!json_get(np, p->key)) (*removed)++;
+        if (rename(tidx, idx) != 0) st = XPKG_ERR_IO;
+        if (have_sig) rename(tsig, sig);
+        else unlink(sig);
+    }
+    unlink(tidx);
+    unlink(tsig);
+    json_free(doc);
+    json_free(old);
+    free(olddata);
+    free(data);
+    free(sigtext);
+    return st;
+}
+
+static xpkg_status_t load_repo(int r, int fetch_missing) {
+    char idx[XPKG_MAX_PATH], sig[XPKG_MAX_PATH];
+    idx_paths(g_repos[r], idx, sig, sizeof(idx));
+    if (access(idx, R_OK) != 0) {
+        if (!fetch_missing) return XPKG_ERR_NOT_FOUND;
+        int a = 0, c = 0, d = 0;
+        xpkg_msg("fetching the package index of %s", g_repos[r]);
+        xpkg_status_t st = update_repo(r, &a, &c, &d);
+        if (st != XPKG_OK) return st;
+    }
+    size_t len = 0;
+    char *data = xpkg_read_file(idx, &len);
+    if (!data) return XPKG_ERR_IO;
+    char *sigtext = xpkg_read_file(sig, NULL);
+    xpkg_status_t st = check_signature(g_repos[r], data, len, sigtext);
+    free(sigtext);
+    if (st != XPKG_OK) { free(data); return st; }
+    char perr[128];
+    json_t *doc = json_parse(data, perr, sizeof(perr));
+    free(data);
+    if (!doc) {
+        xpkg_err("cached index of %s is corrupt (%s); run xpkg update", g_repos[r], perr);
         return XPKG_ERR_BAD_ARCHIVE;
     }
+    int rc = add_entries(r, doc);
+    json_free(doc);
+    return rc == 0 ? XPKG_OK : XPKG_ERR_IO;
+}
 
-    for (int i = 0; i < info.depends_count; i++) {
-        int dep_installed;
-        xpkg_db_is_installed(info.depends[i], &dep_installed);
-        if (!dep_installed) {
-            xpkg_status_t st = resolve_name(info.depends[i]);
-            if (st != XPKG_OK) return st;
-        }
+xpkg_status_t xpkg_index_load(int fetch_missing) {
+    if (g_loaded) return XPKG_OK;
+    repos_load();
+    if (g_nrepos == 0) {
+        xpkg_err("no repositories configured (%s); add one with: xpkg repo add <url>", xpkg_repos_conf());
+        return XPKG_ERR_NOT_FOUND;
     }
+    int ok = 0;
+    for (int r = 0; r < g_nrepos; r++) {
+        xpkg_status_t st = load_repo(r, fetch_missing);
+        if (st == XPKG_OK) ok++;
+        else if (st == XPKG_ERR_SIGNATURE) return st;   /* never silently skip */
+    }
+    g_loaded = 1;
+    return ok ? XPKG_OK : XPKG_ERR_NOT_FOUND;
+}
 
-    g_rstate[idx] = 2;
-    if (g_norder < MAX_RESOLVED) {
-        strncpy(g_order[g_norder], name, sizeof(g_order[g_norder]) - 1);
-        g_order[g_norder][sizeof(g_order[g_norder]) - 1] = '\0';
-        g_norder++;
+/* --- archive fetch ------------------------------------------------------- */
+
+static int archive_ok(const char *path, const xpkg_entry_t *e) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (e->size && (unsigned long long)st.st_size != e->size) return 0;
+    char sha[65];
+    if (xpkg_sha256_file(path, sha) != XPKG_OK) return 0;
+    return !strcmp(sha, e->sha);
+}
+
+xpkg_status_t xpkg_fetch_entry(const xpkg_entry_t *e, char *out, size_t n) {
+    char tok[XPKG_MAX_PATH], dir[XPKG_MAX_PATH];
+    repo_token(g_repos[e->repo], tok, sizeof(tok));
+    snprintf(dir, sizeof(dir), "%s/pkg/%s", xpkg_cache_dir(), tok);
+    if (xpkg_mkdir_p(dir, 0755) != 0) {
+        xpkg_err("cannot create %s: %s", dir, strerror(errno));
+        return XPKG_ERR_IO;
+    }
+    snprintf(out, n, "%s/%s", dir, e->file);
+    if (archive_ok(out, e)) return XPKG_OK;      /* verified cache hit */
+    unlink(out);
+
+    char url[XPKG_MAX_URL], label[160];
+    snprintf(url, sizeof(url), "%s/%s", g_repos[e->repo], e->file);
+    snprintf(label, sizeof(label), "%s-%s", e->name, e->version);
+    if (!xpkg_is_tty() && !xpkg_opts.quiet) printf("  downloading %s\n", label);
+    if (xpkg_net_get(url, out, label) != XPKG_OK) {
+        xpkg_err("download of %s failed", label);
+        return XPKG_ERR_IO;
+    }
+    if (!archive_ok(out, e)) {
+        unlink(out);
+        xpkg_err("%s: checksum mismatch - the download does not match the repository index", label);
+        return XPKG_ERR_VERIFY_FAILED;
     }
     return XPKG_OK;
 }
@@ -389,289 +360,202 @@ static xpkg_status_t resolve_name(const char *name) {
 /* --- commands ------------------------------------------------------------ */
 
 int xpkg_cmd_update(void) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int n = repos_load(repos, MAX_REPOS);
-    if (n == 0) {
-        fprintf(stderr, "xpkg: no repos configured (%s)\n", xpkg_repos_conf());
-        fprintf(stderr, "xpkg: add one with: xpkg repo add <url>\n");
+    repos_load();
+    if (g_nrepos == 0) {
+        xpkg_err("no repositories configured; add one with: xpkg repo add <url>");
         return 1;
     }
+    int fails = 0;
+    for (int r = 0; r < g_nrepos; r++) {
+        int a = 0, c = 0, d = 0;
+        xpkg_msg("updating %s", g_repos[r]);
+        if (update_repo(r, &a, &c, &d) != XPKG_OK) { fails++; continue; }
+        if (!xpkg_opts.quiet)
+            printf("  %d new, %d updated, %d removed\n", a, c, d);
+    }
+    idx_free();
+    return fails ? 1 : 0;
+}
 
-    mkdir(xpkg_cache_dir(), 0755);
-    char idxdir[XPKG_MAX_PATH];
-    snprintf(idxdir, sizeof(idxdir), "%s/idx", xpkg_cache_dir());
-    mkdir(idxdir, 0755);
+static int ci_contains(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return 1;
+    for (; *hay; hay++)
+        if (!strncasecmp(hay, needle, nl)) return 1;
+    return 0;
+}
 
-    int failures = 0;
+static int cmp_entry_name(const void *a, const void *b) {
+    const xpkg_entry_t *const *x = a, *const *y = b;
+    return strcmp((*x)->name, (*y)->name);
+}
+
+int xpkg_cmd_search(const char *term) {
+    if (xpkg_index_load(1) != XPKG_OK) return 1;
+    const xpkg_entry_t **hits = malloc((size_t)(g_nidx + 1) * sizeof(*hits));
+    if (!hits) return 1;
+    int n = 0;
+    for (int i = 0; i < g_nidx; i++)
+        if (ci_contains(g_idx[i].name, term) || ci_contains(g_idx[i].description, term))
+            hits[n++] = &g_idx[i];
+    qsort(hits, (size_t)n, sizeof(*hits), cmp_entry_name);
+    xpkg_db_open();
     for (int i = 0; i < n; i++) {
-        const char *repo = repos[i];
-
-        char cachepath[XPKG_MAX_PATH];
-        repo_index_cache_path(repo, cachepath, sizeof(cachepath));
-
-        /* stash the previous cached index so we can report a diff */
-        char oldpath[XPKG_MAX_PATH];
-        snprintf(oldpath, sizeof(oldpath), "%s.prev", cachepath);
-        if (access(cachepath, R_OK) == 0) {
-            if (rename(cachepath, oldpath) != 0) {
-                remove(cachepath);
-            }
+        xpkg_pkg_row_t row;
+        int inst = xpkg_db_get(hits[i]->name, &row);
+        printf("%s%s%s %s%s%s", xpkg_color("\033[1m"), hits[i]->name, xpkg_color("\033[0m"),
+               xpkg_color("\033[32m"), hits[i]->version, xpkg_color("\033[0m"));
+        if (inst) {
+            if (strcmp(row.version, hits[i]->version)) printf(" [installed: %s]", row.version);
+            else printf(" [installed]");
         }
-
-        char url[XPKG_MAX_PATH];
-        snprintf(url, sizeof(url), "%s/index.json", repo);
-        printf("xpkg: fetching %s\n", url);
-        if (xpkg_net_get(url, cachepath) != XPKG_OK) {
-            fprintf(stderr, "xpkg: update failed for repo %s\n", repo);
-            remove(cachepath);
-            if (access(oldpath, R_OK) == 0) {
-                rename(oldpath, cachepath); /* keep last good cache */
-            }
-            failures++;
-            continue;
-        }
-
-        char *newbuf = read_file(cachepath);
-        if (!newbuf) {
-            fprintf(stderr, "xpkg: could not read cached index for %s\n", repo);
-            failures++;
-            continue;
-        }
-
-        char names[MAX_PKGNAMES][XPKG_MAX_NAME];
-        int nn = json_name_list(newbuf, names, MAX_PKGNAMES);
-        printf("xpkg: repo %s: %d packages\n", repo, nn);
-
-        char *oldbuf = read_file(oldpath);
-        if (oldbuf) {
-            /* diff old vs new */
-            char oldnames[MAX_PKGNAMES][XPKG_MAX_NAME];
-            int on = json_name_list(oldbuf, oldnames, MAX_PKGNAMES);
-
-            int removed = 0, added = 0, changed = 0;
-            /* removed: in old, not in new */
-            for (int a = 0; a < on; a++) {
-                int still = 0;
-                for (int b = 0; b < nn; b++) {
-                    if (strcmp(oldnames[a], names[b]) == 0) { still = 1; break; }
-                }
-                if (!still) {
-                    printf("xpkg:   removed: %s\n", oldnames[a]);
-                    removed++;
-                }
-            }
-            /* added / changed */
-            for (int b = 0; b < nn; b++) {
-                int was = 0;
-                for (int a = 0; a < on; a++) {
-                    if (strcmp(oldnames[a], names[b]) == 0) { was = 1; break; }
-                }
-                if (!was) {
-                    printf("xpkg:   added: %s\n", names[b]);
-                    added++;
-                } else {
-                    char oldver[XPKG_MAX_VERSION], newver[XPKG_MAX_VERSION];
-                    json_pkg_field(oldbuf, names[b], "version", oldver, sizeof(oldver));
-                    json_pkg_field(newbuf, names[b], "version", newver, sizeof(newver));
-                    if (strcmp(oldver, newver) != 0) {
-                        printf("xpkg:   changed: %s %s -> %s\n", names[b], oldver, newver);
-                        changed++;
-                    }
-                }
-            }
-            if (added || removed || changed) {
-                if (added) printf("xpkg:   +%d added", added);
-                if (removed) printf("xpkg:   -%d removed", removed);
-                if (changed) printf("xpkg:   ~%d changed", changed);
-                printf("\n");
-            } else {
-                printf("xpkg:   (no changes)\n");
-            }
-            free(oldbuf);
-            remove(oldpath);
-        }
-
-        free(newbuf);
+        printf("\n    %s\n", hits[i]->description[0] ? hits[i]->description : "(no description)");
     }
-    return failures ? 1 : 0;
-}
-
-int xpkg_cmd_install_repo(const char *name) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int nrepos = repos_load(repos, MAX_REPOS);
-    if (nrepos == 0) {
-        fprintf(stderr, "xpkg: no repos configured (%s)\n", xpkg_repos_conf());
-        fprintf(stderr, "xpkg: add one with: xpkg repo add <url>\n");
+    free(hits);
+    if (n == 0) {
+        fprintf(stderr, "no packages match '%s'\n", term);
         return 1;
-    }
-
-    int installed;
-    xpkg_db_is_installed(name, &installed);
-    if (installed) {
-        fprintf(stderr, "xpkg: %s is already installed (use 'xpkg upgrade %s' to update)\n",
-                name, name);
-        return 1;
-    }
-
-    resolver_reset();
-    xpkg_status_t st = resolve_name(name);
-    if (st != XPKG_OK) {
-        return 1;
-    }
-
-    for (int i = 0; i < g_norder; i++) {
-        int idx = resolver_find(g_order[i]);
-        if (idx < 0) {
-            fprintf(stderr, "xpkg: internal resolver error for %s\n", g_order[i]);
-            return 1;
-        }
-        if (xpkg_cmd_install_ex(g_archive[idx], 1) != 0) {
-            return 1;
-        }
     }
     return 0;
 }
 
-int xpkg_cmd_upgrade(const char *name) {
-    int installed;
-    xpkg_db_is_installed(name, &installed);
-    if (!installed) {
-        fprintf(stderr, "xpkg: %s is not installed\n", name);
+int xpkg_cmd_show(const char *name) {
+    if (xpkg_index_load(1) != XPKG_OK) return 1;
+    const xpkg_entry_t *e = xpkg_index_find(name);
+    xpkg_db_open();
+    xpkg_pkg_row_t row;
+    int inst = xpkg_db_get(name, &row);
+    if (!e) {
+        if (inst) return xpkg_cmd_info(name);
+        xpkg_err("no package named %s", name);
         return 1;
     }
-
-    pkg_entry_t e;
-    if (!repo_find(name, &e)) {
-        fprintf(stderr, "xpkg: no package named %s in any repo\n", name);
-        return 1;
-    }
-
-    char arch[XPKG_MAX_PATH];
-    if (fetch_pkg_archive(&e, arch, sizeof(arch)) != 0) {
-        return 1;
-    }
-    return xpkg_cmd_upgrade_archive(arch);
+    char size[32];
+    xpkg_human_size(e->size, size, sizeof(size));
+    printf("Name        : %s\n", e->name);
+    printf("Version     : %s\n", e->version);
+    printf("Description : %s\n", e->description[0] ? e->description : "-");
+    printf("Architecture: %s\n", e->arch);
+    printf("Depends on  : ");
+    if (!e->has_depends) printf("(listed in the package)");
+    else if (!e->depends_count) printf("-");
+    for (int i = 0; i < e->depends_count; i++) printf("%s%s", i ? " " : "", e->depends[i]);
+    printf("\nDownload    : %s\n", size);
+    printf("Repository  : %s\n", g_repos[e->repo]);
+    printf("Installed   : %s\n", inst ? row.version : "no");
+    if (!arch_ok(e->arch)) printf("Note        : not built for this machine\n");
+    return 0;
 }
 
-typedef struct {
-    int upgraded;
-    int uptodate;
-    int norepo;
-    int failed;
-} upgrade_stats_t;
+typedef struct { int n; } outdated_ctx_t;
 
-static int upgrade_one(const char *name, void *user) {
-    upgrade_stats_t *s = (upgrade_stats_t *)user;
-
-    pkg_entry_t e;
-    if (!repo_find(name, &e)) {
-        printf("xpkg: %s: no update available in any repo\n", name);
-        s->norepo++;
-        return 0;
-    }
-
-    char arch[XPKG_MAX_PATH];
-    if (fetch_pkg_archive(&e, arch, sizeof(arch)) != 0) {
-        s->failed++;
-        return 0;
-    }
-
-    xpkg_info_t info;
-    if (xpkg_pkginfo_from_archive(arch, &info) != XPKG_OK) {
-        printf("xpkg: %s: bad package metadata\n", name);
-        s->failed++;
-        return 0;
-    }
-
-    char oldver[XPKG_MAX_VERSION] = {0};
-    xpkg_db_get_version(name, oldver, sizeof(oldver));
-
-    if (xpkg_version_cmp(info.version, oldver) <= 0) {
-        printf("xpkg: %s %s up to date\n", name, info.version);
-        s->uptodate++;
-        return 0;
-    }
-
-    printf("xpkg: upgrading %s %s -> %s\n", name, oldver, info.version);
-    if (xpkg_cmd_upgrade_archive(arch) == 0) {
-        s->upgraded++;
-    } else {
-        s->failed++;
+static int outdated_cb(const xpkg_pkg_row_t *row, void *user) {
+    outdated_ctx_t *c = user;
+    const xpkg_entry_t *e = xpkg_index_find(row->name);
+    if (e && xpkg_version_cmp(e->version, row->version) > 0) {
+        printf("%s %s -> %s\n", row->name, row->version, e->version);
+        c->n++;
     }
     return 0;
 }
 
-int xpkg_cmd_upgrade_all(void) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int nrepos = repos_load(repos, MAX_REPOS);
-    if (nrepos == 0) {
-        fprintf(stderr, "xpkg: no repos configured (%s)\n", xpkg_repos_conf());
-        fprintf(stderr, "xpkg: add one with: xpkg repo add <url>\n");
-        return 1;
-    }
-
-    upgrade_stats_t s = {0, 0, 0, 0};
-    xpkg_db_foreach(upgrade_one, &s);
-
-    printf("xpkg: upgrade results: %d upgraded, %d up to date, %d no repo package, %d failed\n",
-           s.upgraded, s.uptodate, s.norepo, s.failed);
-    return s.failed ? 1 : 0;
+int xpkg_cmd_outdated(void) {
+    if (xpkg_index_load(1) != XPKG_OK) return 1;
+    if (xpkg_db_open() != XPKG_OK) return 1;
+    outdated_ctx_t c = { 0 };
+    xpkg_db_each_package(outdated_cb, &c);
+    if (!c.n && !xpkg_opts.quiet) printf("everything is up to date\n");
+    return 0;
 }
-
-/* --- repo add/remove/list ---------------------------------------------- */
 
 int xpkg_cmd_repo_add(const char *url) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int n = repos_load(repos, MAX_REPOS);
-    for (int i = 0; i < n; i++) {
-        if (strcmp(repos[i], url) == 0) {
-            printf("xpkg: repo already present: %s\n", url);
-            return 0;
-        }
-    }
-    if (n >= MAX_REPOS) {
-        fprintf(stderr, "xpkg: too many repos (max %d)\n", MAX_REPOS);
+    if (strncasecmp(url, "https://", 8) && strncasecmp(url, "http://", 7)) {
+        xpkg_err("repository URLs start with https:// (or http://)");
         return 1;
     }
-    strncpy(repos[n], url, XPKG_MAX_PATH - 1);
-    repos[n][XPKG_MAX_PATH - 1] = '\0';
-    repos_save(repos, n + 1);
-    printf("xpkg: added repo: %s\n", url);
+    if (!strncasecmp(url, "http://", 7))
+        xpkg_warn("plain HTTP: only the index signature protects this repository");
+    repos_load();
+    char clean[XPKG_MAX_PATH];
+    snprintf(clean, sizeof(clean), "%s", url);
+    size_t l = strlen(clean);
+    while (l > 0 && clean[l - 1] == '/') clean[--l] = '\0';
+    for (int i = 0; i < g_nrepos; i++)
+        if (!strcmp(g_repos[i], clean)) { printf("already configured: %s\n", clean); return 0; }
+    if (g_nrepos >= MAX_REPOS) { xpkg_err("too many repositories (max %d)", MAX_REPOS); return 1; }
+    snprintf(g_repos[g_nrepos++], XPKG_MAX_PATH, "%s", clean);
+    if (repos_save() != 0) { xpkg_err("cannot write %s", xpkg_repos_conf()); return 1; }
+    printf("added %s (run: xpkg update)\n", clean);
     return 0;
 }
 
 int xpkg_cmd_repo_remove(const char *url) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int n = repos_load(repos, MAX_REPOS);
-    int removed = 0;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(repos[i], url) == 0) {
-            for (int j = i; j < n - 1; j++) {
-                strcpy(repos[j], repos[j + 1]);
-            }
-            n--;
-            removed = 1;
-            i--;
-        }
+    repos_load();
+    char clean[XPKG_MAX_PATH];
+    snprintf(clean, sizeof(clean), "%s", url);
+    size_t l = strlen(clean);
+    while (l > 0 && clean[l - 1] == '/') clean[--l] = '\0';
+    int found = 0;
+    for (int i = 0; i < g_nrepos; i++) {
+        if (strcmp(g_repos[i], clean)) continue;
+        found = 1;
+        char idx[XPKG_MAX_PATH], sig[XPKG_MAX_PATH];
+        idx_paths(clean, idx, sig, sizeof(idx));
+        unlink(idx);
+        unlink(sig);
+        memmove(g_repos[i], g_repos[i + 1], (size_t)(g_nrepos - i - 1) * XPKG_MAX_PATH);
+        g_nrepos--;
+        break;
     }
-    repos_save(repos, n);
-    if (!removed) {
-        fprintf(stderr, "xpkg: repo not found: %s\n", url);
-        return 1;
-    }
-    printf("xpkg: removed repo: %s\n", url);
+    if (!found) { xpkg_err("not configured: %s", clean); return 1; }
+    if (repos_save() != 0) { xpkg_err("cannot write %s", xpkg_repos_conf()); return 1; }
+    printf("removed %s\n", clean);
     return 0;
 }
 
 int xpkg_cmd_repo_list(void) {
-    char repos[MAX_REPOS][XPKG_MAX_PATH];
-    int n = repos_load(repos, MAX_REPOS);
-    if (n == 0) {
-        printf("(no repos configured; add with: xpkg repo add <url>)\n");
-        return 0;
+    repos_load();
+    if (!g_nrepos) { printf("(no repositories; add one with: xpkg repo add <url>)\n"); return 0; }
+    for (int i = 0; i < g_nrepos; i++) {
+        char idx[XPKG_MAX_PATH], sig[XPKG_MAX_PATH];
+        idx_paths(g_repos[i], idx, sig, sizeof(idx));
+        const char *state = access(idx, R_OK) ? "not fetched yet"
+                          : access(sig, R_OK) ? "unsigned" : "signed";
+        printf("%d  %s  (%s)\n", i + 1, g_repos[i], state);
     }
-    for (int i = 0; i < n; i++) {
-        printf("%s\n", repos[i]);
+    return 0;
+}
+
+/* Machine-readable listing for front ends (flxpkg):
+ *   name TAB repo-version TAB installed-version TAB size TAB description
+ * Every repository package, then installed packages no repository has. */
+static void tsv_field(const char *s) {
+    for (; *s; s++) putchar(*s == '\t' || *s == '\n' ? ' ' : *s);
+}
+
+typedef struct { int dummy; } query_ctx_t;
+
+static int query_local_cb(const xpkg_pkg_row_t *row, void *user) {
+    (void)user;
+    if (xpkg_index_find(row->name)) return 0;
+    printf("%s\t\t%s\t0\t", row->name, row->version);
+    tsv_field(row->description);
+    putchar('\n');
+    return 0;
+}
+
+int xpkg_cmd_query(void) {
+    int have_index = xpkg_index_load(0) == XPKG_OK;
+    if (xpkg_db_open() != XPKG_OK) return 1;
+    for (int i = 0; have_index && i < g_nidx; i++) {
+        const xpkg_entry_t *e = &g_idx[i];
+        xpkg_pkg_row_t row;
+        int inst = xpkg_db_get(e->name, &row);
+        printf("%s\t%s\t%s\t%llu\t", e->name, e->version, inst ? row.version : "", e->size);
+        tsv_field(e->description);
+        putchar('\n');
     }
+    query_ctx_t c;
+    xpkg_db_each_package(query_local_cb, &c);
     return 0;
 }

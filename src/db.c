@@ -1,353 +1,300 @@
-/* db.c - the installed-package database, backed by SQLite.
+/* db.c - the installed-package database (SQLite).
  *
- * Schema (see docs/DATABASE.md for the full write-up):
+ *   packages(name PRIMARY KEY, version, description, installed_at,
+ *            explicit)          explicit = 1 when the user asked for it,
+ *                               0 when it came in as a dependency
+ *   files(package_name, path, sha256)   one row per file/symlink owned
+ *   depends(package_name, dep)          declared dependencies
  *
- *     CREATE TABLE packages (
- *         name         TEXT PRIMARY KEY,
- *         version      TEXT NOT NULL,
- *         description  TEXT,
- *         installed_at INTEGER NOT NULL
- *     );
- *
- *     CREATE TABLE files (
- *         package_name TEXT NOT NULL,
- *         path         TEXT NOT NULL,
- *         sha256       TEXT NOT NULL,
- *         FOREIGN KEY(package_name) REFERENCES packages(name)
- *     );
- *
- * Every function here opens its own sqlite3 connection to XPKG_DB_PATH and
- * closes it before returning. SQLite connections are cheap to open, and
- * this keeps every command in cmd_*.c simple (no connection object to
- * thread through call chains) at negligible cost for a package manager
- * that isn't handling high call volume.
+ * One connection per process; every package change runs inside a
+ * transaction so a crash never leaves a half-registered package.  Older
+ * (v1) databases are migrated in place on open.
  */
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <sys/stat.h>
 #include <sqlite3.h>
 #include "xpkg.h"
 
-static xpkg_status_t open_db(sqlite3 **db) {
-    /* xpkg_db_dir() must exist before sqlite3_open can create the db file
-     * inside it. mkdir failing because the directory already exists is
-     * fine and expected on every call after the first; any other mkdir
-     * failure will surface naturally when sqlite3_open itself fails. */
-    mkdir(xpkg_db_dir(), 0755);
+#define DB_SCHEMA_VERSION 2
 
-    if (sqlite3_open(xpkg_db_path(), db) != SQLITE_OK) {
-        fprintf(stderr, "xpkg: cannot open database at %s: %s\n",
-                xpkg_db_path(), sqlite3_errmsg(*db));
-        sqlite3_close(*db);
+static sqlite3 *g_db;
+
+static int exec(const char *sql) {
+    char *msg = NULL;
+    if (sqlite3_exec(g_db, sql, NULL, NULL, &msg) != SQLITE_OK) {
+        xpkg_err("database: %s", msg ? msg : "error");
+        sqlite3_free(msg);
+        return -1;
+    }
+    return 0;
+}
+
+static int user_version(void) {
+    sqlite3_stmt *s;
+    int v = 0;
+    if (sqlite3_prepare_v2(g_db, "PRAGMA user_version;", -1, &s, NULL) == SQLITE_OK) {
+        if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+    }
+    return v;
+}
+
+static int has_column(const char *table, const char *col) {
+    char sql[128];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
+    sqlite3_stmt *s;
+    int found = 0;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &s, NULL) == SQLITE_OK) {
+        while (sqlite3_step(s) == SQLITE_ROW)
+            if (!strcmp((const char *)sqlite3_column_text(s, 1), col)) found = 1;
+        sqlite3_finalize(s);
+    }
+    return found;
+}
+
+xpkg_status_t xpkg_db_open(void) {
+    if (g_db) return XPKG_OK;
+    if (xpkg_mkdir_p(xpkg_db_dir(), 0755) != 0) {
+        xpkg_err("cannot create %s", xpkg_db_dir());
+        return XPKG_ERR_DB;
+    }
+    if (sqlite3_open(xpkg_db_path(), &g_db) != SQLITE_OK) {
+        xpkg_err("cannot open database %s: %s", xpkg_db_path(), sqlite3_errmsg(g_db));
+        sqlite3_close(g_db);
+        g_db = NULL;
+        return XPKG_ERR_DB;
+    }
+    sqlite3_busy_timeout(g_db, 10000);
+    if (exec("PRAGMA foreign_keys=OFF; PRAGMA synchronous=FULL;") != 0) return XPKG_ERR_DB;
+    if (exec("CREATE TABLE IF NOT EXISTS packages ("
+             "  name TEXT PRIMARY KEY, version TEXT NOT NULL, description TEXT,"
+             "  installed_at INTEGER NOT NULL, explicit INTEGER NOT NULL DEFAULT 1);"
+             "CREATE TABLE IF NOT EXISTS files ("
+             "  package_name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL);"
+             "CREATE TABLE IF NOT EXISTS depends ("
+             "  package_name TEXT NOT NULL, dep TEXT NOT NULL);") != 0)
+        return XPKG_ERR_DB;
+    if (user_version() < DB_SCHEMA_VERSION) {
+        if (!has_column("packages", "explicit") &&
+            exec("ALTER TABLE packages ADD COLUMN explicit INTEGER NOT NULL DEFAULT 1;") != 0)
+            return XPKG_ERR_DB;
+        if (exec("CREATE INDEX IF NOT EXISTS files_path ON files(path);"
+                 "CREATE INDEX IF NOT EXISTS files_pkg ON files(package_name);"
+                 "CREATE INDEX IF NOT EXISTS depends_pkg ON depends(package_name);"
+                 "CREATE INDEX IF NOT EXISTS depends_dep ON depends(dep);"
+                 "PRAGMA user_version=2;") != 0)
+            return XPKG_ERR_DB;
+    }
+    return XPKG_OK;
+}
+
+void xpkg_db_close(void) {
+    if (g_db) sqlite3_close(g_db);
+    g_db = NULL;
+}
+
+xpkg_status_t xpkg_db_begin(void) {
+    return exec("BEGIN IMMEDIATE;") == 0 ? XPKG_OK : XPKG_ERR_DB;
+}
+
+xpkg_status_t xpkg_db_commit(void) {
+    return exec("COMMIT;") == 0 ? XPKG_OK : XPKG_ERR_DB;
+}
+
+void xpkg_db_rollback(void) {
+    sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+}
+
+static sqlite3_stmt *prep(const char *sql) {
+    sqlite3_stmt *s = NULL;
+    if (xpkg_db_open() != XPKG_OK) return NULL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &s, NULL) != SQLITE_OK) {
+        xpkg_err("database: %s", sqlite3_errmsg(g_db));
+        return NULL;
+    }
+    return s;
+}
+
+static void copy_col(sqlite3_stmt *s, int i, char *out, size_t n) {
+    const char *t = (const char *)sqlite3_column_text(s, i);
+    snprintf(out, n, "%s", t ? t : "");
+}
+
+int xpkg_db_get(const char *name, xpkg_pkg_row_t *out) {
+    sqlite3_stmt *s = prep("SELECT name, version, description, installed_at, explicit "
+                           "FROM packages WHERE name = ?;");
+    if (!s) return 0;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    int found = sqlite3_step(s) == SQLITE_ROW;
+    if (found && out) {
+        copy_col(s, 0, out->name, sizeof(out->name));
+        copy_col(s, 1, out->version, sizeof(out->version));
+        copy_col(s, 2, out->description, sizeof(out->description));
+        out->installed_at = sqlite3_column_int64(s, 3);
+        out->explicit_ = sqlite3_column_int(s, 4);
+    }
+    sqlite3_finalize(s);
+    return found;
+}
+
+int xpkg_db_is_installed(const char *name) {
+    return xpkg_db_get(name, NULL);
+}
+
+static xpkg_status_t step_done(sqlite3_stmt *s) {
+    int rc = sqlite3_step(s);
+    if (rc != SQLITE_DONE) xpkg_err("database: %s", sqlite3_errmsg(g_db));
+    sqlite3_finalize(s);
+    return rc == SQLITE_DONE ? XPKG_OK : XPKG_ERR_DB;
+}
+
+xpkg_status_t xpkg_db_put_package(const xpkg_info_t *info, int explicit_) {
+    sqlite3_stmt *s = prep("INSERT INTO packages (name, version, description, installed_at, explicit) "
+                           "VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(name) DO UPDATE SET "
+                           "version = ?2, description = ?3, installed_at = ?4, "
+                           "explicit = MAX(explicit, ?5);");
+    if (!s) return XPKG_ERR_DB;
+    sqlite3_bind_text(s, 1, info->name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, info->version, -1, SQLITE_STATIC);
+    sqlite3_bind_text(s, 3, info->description, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 4, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int(s, 5, explicit_ ? 1 : 0);
+    if (step_done(s) != XPKG_OK) return XPKG_ERR_DB;
+
+    s = prep("DELETE FROM depends WHERE package_name = ?;");
+    if (!s) return XPKG_ERR_DB;
+    sqlite3_bind_text(s, 1, info->name, -1, SQLITE_STATIC);
+    if (step_done(s) != XPKG_OK) return XPKG_ERR_DB;
+    for (int i = 0; i < info->depends_count; i++) {
+        char dep[XPKG_MAX_NAME];
+        xpkg_dep_name(info->depends[i], dep, sizeof(dep));
+        s = prep("INSERT INTO depends (package_name, dep) VALUES (?, ?);");
+        if (!s) return XPKG_ERR_DB;
+        sqlite3_bind_text(s, 1, info->name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 2, dep, -1, SQLITE_TRANSIENT);
+        if (step_done(s) != XPKG_OK) return XPKG_ERR_DB;
+    }
+    return XPKG_OK;
+}
+
+xpkg_status_t xpkg_db_set_explicit(const char *name, int explicit_) {
+    sqlite3_stmt *s = prep("UPDATE packages SET explicit = ? WHERE name = ?;");
+    if (!s) return XPKG_ERR_DB;
+    sqlite3_bind_int(s, 1, explicit_);
+    sqlite3_bind_text(s, 2, name, -1, SQLITE_STATIC);
+    return step_done(s);
+}
+
+xpkg_status_t xpkg_db_delete_package(const char *name) {
+    const char *sqls[] = {
+        "DELETE FROM files WHERE package_name = ?;",
+        "DELETE FROM depends WHERE package_name = ?;",
+        "DELETE FROM packages WHERE name = ?;",
+    };
+    for (int i = 0; i < 3; i++) {
+        sqlite3_stmt *s = prep(sqls[i]);
+        if (!s) return XPKG_ERR_DB;
+        sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+        if (step_done(s) != XPKG_OK) return XPKG_ERR_DB;
+    }
+    return XPKG_OK;
+}
+
+xpkg_status_t xpkg_db_clear_files(const char *name) {
+    sqlite3_stmt *s = prep("DELETE FROM files WHERE package_name = ?;");
+    if (!s) return XPKG_ERR_DB;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    return step_done(s);
+}
+
+xpkg_status_t xpkg_db_add_file(const char *name, const char *path, const char *sha256) {
+    static sqlite3_stmt *s;   /* hot path: reuse the statement */
+    if (!s && !(s = prep("INSERT INTO files (package_name, path, sha256) VALUES (?, ?, ?);")))
+        return XPKG_ERR_DB;
+    sqlite3_reset(s);
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, sha256, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        xpkg_err("database: %s", sqlite3_errmsg(g_db));
         return XPKG_ERR_DB;
     }
     return XPKG_OK;
 }
 
-xpkg_status_t xpkg_db_init(void) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
+int xpkg_db_file_owner(const char *path, char *owner, size_t ownersz) {
+    sqlite3_stmt *s = prep("SELECT package_name FROM files WHERE path = ? LIMIT 1;");
+    if (!s) return 0;
+    sqlite3_bind_text(s, 1, path, -1, SQLITE_STATIC);
+    int found = sqlite3_step(s) == SQLITE_ROW;
+    if (found && owner) copy_col(s, 0, owner, ownersz);
+    sqlite3_finalize(s);
+    return found;
+}
 
-    const char *schema =
-        "CREATE TABLE IF NOT EXISTS packages ("
-        "  name TEXT PRIMARY KEY,"
-        "  version TEXT NOT NULL,"
-        "  description TEXT,"
-        "  installed_at INTEGER NOT NULL"
-        ");"
-        "CREATE TABLE IF NOT EXISTS files ("
-        "  package_name TEXT NOT NULL,"
-        "  path TEXT NOT NULL,"
-        "  sha256 TEXT NOT NULL,"
-        "  FOREIGN KEY(package_name) REFERENCES packages(name)"
-        ");";
+int xpkg_db_file_sha(const char *name, const char *path, char out[65]) {
+    sqlite3_stmt *s = prep("SELECT sha256 FROM files WHERE package_name = ? AND path = ? LIMIT 1;");
+    if (!s) return 0;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, path, -1, SQLITE_STATIC);
+    int found = sqlite3_step(s) == SQLITE_ROW;
+    if (found) copy_col(s, 0, out, 65);
+    sqlite3_finalize(s);
+    return found;
+}
 
-    char *errmsg = NULL;
-    int rc = sqlite3_exec(db, schema, NULL, NULL, &errmsg);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "xpkg: schema init failed: %s\n", errmsg);
-        sqlite3_free(errmsg);
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
+xpkg_status_t xpkg_db_each_package(xpkg_row_cb cb, void *user) {
+    sqlite3_stmt *s = prep("SELECT name, version, description, installed_at, explicit "
+                           "FROM packages ORDER BY name;");
+    if (!s) return XPKG_ERR_DB;
+    xpkg_pkg_row_t row;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        copy_col(s, 0, row.name, sizeof(row.name));
+        copy_col(s, 1, row.version, sizeof(row.version));
+        copy_col(s, 2, row.description, sizeof(row.description));
+        row.installed_at = sqlite3_column_int64(s, 3);
+        row.explicit_ = sqlite3_column_int(s, 4);
+        if (cb(&row, user)) break;
     }
-
-    sqlite3_close(db);
+    sqlite3_finalize(s);
     return XPKG_OK;
 }
 
-xpkg_status_t xpkg_db_is_installed(const char *pkg_name, int *out_installed) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT 1 FROM packages WHERE name = ? LIMIT 1;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
+static xpkg_status_t each_pair(const char *sql, const char *name, xpkg_str_cb cb, void *user, int two) {
+    sqlite3_stmt *s = prep(sql);
+    if (!s) return XPKG_ERR_DB;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *a = (const char *)sqlite3_column_text(s, 0);
+        const char *b = two ? (const char *)sqlite3_column_text(s, 1) : NULL;
+        if (cb(a ? a : "", b, user)) break;
     }
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-
-    *out_installed = (sqlite3_step(stmt) == SQLITE_ROW) ? 1 : 0;
-
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
+    sqlite3_finalize(s);
     return XPKG_OK;
 }
 
-xpkg_status_t xpkg_db_register_package(const xpkg_info_t *info) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql =
-        "INSERT INTO packages (name, version, description, installed_at) "
-        "VALUES (?, ?, ?, ?);";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "xpkg: %s\n", sqlite3_errmsg(db));
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-
-    sqlite3_bind_text(stmt, 1, info->name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, info->version, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, info->description, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)time(NULL));
-
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
-    return (rc == SQLITE_DONE) ? XPKG_OK : XPKG_ERR_DB;
+xpkg_status_t xpkg_db_each_file(const char *name, xpkg_str_cb cb, void *user) {
+    return each_pair("SELECT path, sha256 FROM files WHERE package_name = ? ORDER BY path;",
+                     name, cb, user, 1);
 }
 
-xpkg_status_t xpkg_db_register_file(const char *pkg_name, const char *path, const char *sha256) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql =
-        "INSERT INTO files (package_name, path, sha256) VALUES (?, ?, ?);";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, path, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, sha256, -1, SQLITE_STATIC);
-
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
-    return (rc == SQLITE_DONE) ? XPKG_OK : XPKG_ERR_DB;
+xpkg_status_t xpkg_db_each_depend(const char *name, xpkg_str_cb cb, void *user) {
+    return each_pair("SELECT dep FROM depends WHERE package_name = ? ORDER BY dep;",
+                     name, cb, user, 0);
 }
 
-xpkg_status_t xpkg_db_remove_package(const char *pkg_name) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-
-    /* Delete files first (no cascading delete configured -- keep it
-     * explicit and simple rather than relying on SQLite foreign-key
-     * pragmas that may not be enabled by default). */
-    if (sqlite3_prepare_v2(db, "DELETE FROM files WHERE package_name = ?;", -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-
-    if (sqlite3_prepare_v2(db, "DELETE FROM packages WHERE name = ?;", -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-
-    sqlite3_close(db);
-    return XPKG_OK;
+xpkg_status_t xpkg_db_each_rdepend(const char *name, xpkg_str_cb cb, void *user) {
+    return each_pair("SELECT d.package_name FROM depends d JOIN packages p "
+                     "ON p.name = d.package_name WHERE d.dep = ? ORDER BY 1;",
+                     name, cb, user, 0);
 }
 
-xpkg_status_t xpkg_db_list(void) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT name, version FROM packages ORDER BY name;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        printf("%s %s\n",
-               sqlite3_column_text(stmt, 0),
-               sqlite3_column_text(stmt, 1));
-    }
-
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return XPKG_OK;
-}
-
-xpkg_status_t xpkg_db_info(const char *pkg_name) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql =
-        "SELECT name, version, description, installed_at "
-        "FROM packages WHERE name = ?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        printf("Name:        %s\n", sqlite3_column_text(stmt, 0));
-        printf("Version:     %s\n", sqlite3_column_text(stmt, 1));
-        printf("Description: %s\n", sqlite3_column_text(stmt, 2));
-        printf("Installed:   %lld\n", (long long)sqlite3_column_int64(stmt, 3));
-    } else {
-        fprintf(stderr, "xpkg: package not installed: %s\n", pkg_name);
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
-        return XPKG_ERR_NOT_FOUND;
-    }
-
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return XPKG_OK;
-}
-
-xpkg_status_t xpkg_db_files(const char *pkg_name) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT path FROM files WHERE package_name = ? ORDER BY path;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-
-    int any = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        printf("%s\n", sqlite3_column_text(stmt, 0));
-        any = 1;
-    }
-
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
-    if (!any) {
-        fprintf(stderr, "xpkg: no files recorded for %s (installed?)\n", pkg_name);
-        return XPKG_ERR_NOT_FOUND;
-    }
-    return XPKG_OK;
-}
-
-xpkg_status_t xpkg_db_get_version(const char *pkg_name, char *out, size_t outsz) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    out[0] = '\0';
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT version FROM packages WHERE name = ?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *v = (const char *)sqlite3_column_text(stmt, 0);
-        if (v) {
-            strncpy(out, v, outsz - 1);
-            out[outsz - 1] = '\0';
-        }
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return XPKG_OK;
-}
-
-/* Deletes all file rows for a package without touching the package row
- * itself (used by redeploying/upgrade, where the file set is re-written). */
-xpkg_status_t xpkg_db_clear_files(const char *pkg_name) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "DELETE FROM files WHERE package_name = ?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, pkg_name, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return XPKG_OK;
-}
-
-xpkg_status_t xpkg_db_set_version(const char *pkg_name, const char *version) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "UPDATE packages SET version = ? WHERE name = ?;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-    sqlite3_bind_text(stmt, 1, version, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, pkg_name, -1, SQLITE_STATIC);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
-    return (rc == SQLITE_DONE) ? XPKG_OK : XPKG_ERR_DB;
-}
-
-xpkg_status_t xpkg_db_foreach(xpkg_db_pkg_iterator it, void *user) {
-    sqlite3 *db;
-    xpkg_status_t st = open_db(&db);
-    if (st != XPKG_OK) return st;
-
-    sqlite3_stmt *stmt;
-    const char *sql = "SELECT name FROM packages ORDER BY name;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_close(db);
-        return XPKG_ERR_DB;
-    }
-
-    xpkg_status_t ret = XPKG_OK;
-    int early = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *name = (const char *)sqlite3_column_text(stmt, 0);
-        if (it && !it(name, user)) {
-            early = 1;
-            break;
-        }
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-
-    if (early) ret = XPKG_ERR_NOT_FOUND; /* signal the caller stopped iteration */
-    return ret;
+int xpkg_db_count_files(const char *name) {
+    sqlite3_stmt *s = prep("SELECT COUNT(*) FROM files WHERE package_name = ?;");
+    if (!s) return 0;
+    sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
+    int n = sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int(s, 0) : 0;
+    sqlite3_finalize(s);
+    return n;
 }
