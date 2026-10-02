@@ -68,6 +68,24 @@ static int path_is_safe(const char *p) {
     return 1;
 }
 
+/* No directory on the way from dest_dir to dest_dir/rel may be a symlink:
+ * an archive could otherwise plant "etc -> /etc" and write "etc/shadow"
+ * through it.  Everything below dest_dir came from this archive, so a
+ * symlink there is always the archive's own. */
+static int parents_are_real(const char *dest_dir, const char *rel) {
+    char p[XPKG_MAX_PATH];
+    size_t dl = strlen(dest_dir);
+    if (snprintf(p, sizeof(p), "%s/%s", dest_dir, rel) >= (int)sizeof(p)) return 0;
+    for (char *c = p + dl + 1; (c = strchr(c, '/')) != NULL; c++) {
+        struct stat st;
+        *c = '\0';
+        int bad = lstat(p, &st) == 0 && !S_ISDIR(st.st_mode);
+        *c = '/';
+        if (bad) return 0;
+    }
+    return 1;
+}
+
 static int read_block(gzFile gz, unsigned char *b) {
     int n = gzread(gz, b, USTAR_BLOCK);
     return n == USTAR_BLOCK ? 0 : (n == 0 ? 1 : -1);
@@ -97,6 +115,8 @@ static void pax_parse(const char *data, char **path, char **linkpath, unsigned l
         char *end;
         unsigned long len = strtoul(p, &end, 10);
         if (end == p || *end != ' ' || len == 0) return;
+        /* the record must lie within the data: "len" is attacker-supplied */
+        if (len > strlen(p) || (size_t)(end + 1 - p) >= len) return;
         const char *rec = p;
         const char *kv = end + 1;
         const char *eq = strchr(kv, '=');
@@ -166,6 +186,11 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
         if (has_pax_size) size = pax_size;
 
         char rel[XPKG_MAX_PATH];
+        if (long_path && strlen(long_path) >= sizeof(rel)) {
+            xpkg_err("archive entry name too long in %s", archive_path);
+            st = XPKG_ERR_BAD_ARCHIVE;
+            break;
+        }
         if (long_path) snprintf(rel, sizeof(rel), "%s", long_path);
         else if (h->prefix[0]) snprintf(rel, sizeof(rel), "%.155s/%.100s", h->prefix, h->name);
         else snprintf(rel, sizeof(rel), "%.100s", h->name);
@@ -183,7 +208,7 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
         has_pax_size = 0;
 
         unsigned long long blocks = (size + USTAR_BLOCK - 1) / USTAR_BLOCK;
-        if (!path_is_safe(relp)) {
+        if (!path_is_safe(relp) || !parents_are_real(dest_dir, relp)) {
             xpkg_err("refusing unsafe archive entry '%s' in %s", relp, archive_path);
             st = XPKG_ERR_BAD_ARCHIVE;
             break;
@@ -198,6 +223,8 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
         mode_t mode = (mode_t)(parse_octal(h->mode, sizeof(h->mode)) & 07777);
 
         if (type == '5') {
+            struct stat ls;
+            if (lstat(full, &ls) == 0 && !S_ISDIR(ls.st_mode)) unlink(full);   /* chmod would follow a symlink */
             if (mkdir(full, 0755) != 0 && errno != EEXIST) { st = XPKG_ERR_IO; break; }
             chmod(full, mode ? mode : 0755);
         } else if (type == '2') {
@@ -211,7 +238,7 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir) {
             /* hardlink to an earlier entry of this archive */
             char *lp = linkpath;
             while (lp[0] == '.' && lp[1] == '/') lp += 2;
-            if (!path_is_safe(lp)) {
+            if (!path_is_safe(lp) || !parents_are_real(dest_dir, lp)) {
                 xpkg_err("refusing unsafe hardlink '%s' in %s", lp, archive_path);
                 st = XPKG_ERR_BAD_ARCHIVE;
                 break;

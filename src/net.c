@@ -280,7 +280,8 @@ static void resolve_location(const url_t *u, const char *loc, char *next, size_t
     snprintf(next, n, "%s%s%s", origin, dir, loc);
 }
 
-static xpkg_status_t get_once(const char *url, FILE *out, const char *label, char *redirect, size_t rsz) {
+static xpkg_status_t get_once(const char *url, FILE *out, const char *label, char *redirect, size_t rsz,
+                              unsigned long long max) {
     url_t u;
     if (parse_url(url, &u) != 0) {
         xpkg_err("bad URL: %s", url);
@@ -335,6 +336,11 @@ static xpkg_status_t get_once(const char *url, FILE *out, const char *label, cha
         goto done;
     }
 
+    if (clen > 0 && (unsigned long long)clen > max) {
+        xpkg_err("%s is larger than expected (%lld bytes)", url, clen);
+        st = XPKG_ERR_VERIFY_FAILED;
+        goto done;
+    }
     progress_t p = { label, clen > 0 ? (unsigned long long)clen : 0, 0, now_s(), 0 };
     unsigned char buf[65536];
     if (chunked) {
@@ -344,6 +350,7 @@ static xpkg_status_t get_once(const char *url, FILE *out, const char *label, cha
             unsigned long long left = strtoull(line, &end, 16);
             if (end == line) { st = XPKG_ERR_IO; break; }
             if (left == 0) break;
+            if (left > max - p.done) { st = XPKG_ERR_VERIFY_FAILED; break; }
             while (left > 0) {
                 long r = conn_read(&c, buf, left < sizeof(buf) ? (size_t)left : sizeof(buf));
                 if (r <= 0) { st = XPKG_ERR_IO; break; }
@@ -365,6 +372,7 @@ static xpkg_status_t get_once(const char *url, FILE *out, const char *label, cha
             long r = conn_read(&c, buf, want);
             if (r < 0) { st = XPKG_ERR_IO; break; }
             if (r == 0) break;
+            if ((unsigned long long)r > max - p.done) { st = XPKG_ERR_VERIFY_FAILED; break; }
             if (fwrite(buf, 1, (size_t)r, out) != (size_t)r) { st = XPKG_ERR_IO; break; }
             p.done += (unsigned long long)r;
             progress_draw(&p, 0);
@@ -374,7 +382,8 @@ static xpkg_status_t get_once(const char *url, FILE *out, const char *label, cha
     if (st == XPKG_OK) progress_draw(&p, 1);
     else {
         if (p.label && isatty(STDOUT_FILENO) && !xpkg_opts.quiet) putchar('\n');
-        xpkg_err("download of %s was cut off", url);
+        if (st == XPKG_ERR_VERIFY_FAILED) xpkg_err("%s is larger than expected; download stopped", url);
+        else xpkg_err("download of %s was cut off", url);
     }
 done:
     free(line);
@@ -382,14 +391,16 @@ done:
     return st;
 }
 
-static xpkg_status_t net_get_once(const char *url, const char *dest_path, const char *label);
+static xpkg_status_t net_get_once(const char *url, const char *dest_path, const char *label,
+                                  unsigned long long max);
 
 /* Network hiccups (DNS "try again", a dropped connection) are retried with a
  * short back-off; a definite answer (404, bad certificate) is not. */
-xpkg_status_t xpkg_net_get(const char *url, const char *dest_path, const char *label) {
+xpkg_status_t xpkg_net_get(const char *url, const char *dest_path, const char *label,
+                           unsigned long long max) {
     xpkg_status_t st = XPKG_ERR_IO;
     for (int attempt = 1; attempt <= 4; attempt++) {
-        st = net_get_once(url, dest_path, label);
+        st = net_get_once(url, dest_path, label, max);
         if (st != XPKG_ERR_IO || attempt == 4) break;
         if (!xpkg_opts.quiet) fprintf(stderr, "xpkg: retrying in %d s (attempt %d of 4)\n", attempt * 2, attempt + 1);
         sleep((unsigned)(attempt * 2));
@@ -397,7 +408,8 @@ xpkg_status_t xpkg_net_get(const char *url, const char *dest_path, const char *l
     return st;
 }
 
-static xpkg_status_t net_get_once(const char *url, const char *dest_path, const char *label) {
+static xpkg_status_t net_get_once(const char *url, const char *dest_path, const char *label,
+                                  unsigned long long max) {
     static int init = 0;
     if (!init) {
         OPENSSL_init_ssl(0, NULL);
@@ -416,7 +428,7 @@ static xpkg_status_t net_get_once(const char *url, const char *dest_path, const 
             xpkg_err("cannot write %s: %s", part, strerror(errno));
             break;
         }
-        st = get_once(cur, out, label, next, XPKG_MAX_URL);
+        st = get_once(cur, out, label, next, XPKG_MAX_URL, max);
         if (fclose(out) != 0 && st == XPKG_OK) st = XPKG_ERR_IO;
         if (st != XPKG_OK) break;
         if (!next[0]) {

@@ -7,8 +7,9 @@
  *         "arch": "x86_64", "file": "<name>-1.0.xpkg", "size": 123,
  *         "sha256": "<hex>", "depends": ["a", "b"] } } }
  *
- * Trust: when any key is installed in /etc/xpkg/keys, every index must carry
- * a valid Ed25519 signature by one of them (--allow-unsigned overrides).
+ * Trust: every index must carry a valid Ed25519 signature by one of the keys
+ * in /etc/xpkg/keys; no keys means no repo is accepted (--allow-unsigned
+ * overrides both).
  * The signature covers the whole index, and the index pins every archive's
  * size and sha256, so nothing unsigned is ever installed.  `generated`
  * must not go backwards between updates, which stops a mirror from
@@ -85,12 +86,17 @@ static void idx_paths(const char *url, char *idx, char *sig, size_t n) {
 /* --- signature policy --------------------------------------------------- */
 
 static xpkg_status_t check_signature(const char *url, const char *data, size_t len, const char *sig) {
+    /* no keys means nothing can be verified: refuse, like a bad signature
+     * (a deleted key directory must not quietly turn checking off) */
     if (!xpkg_have_keys()) {
-        static int warned;
-        if (!warned && !xpkg_opts.allow_unsigned)
-            xpkg_warn("no trusted keys in %s: repository signatures are not checked", xpkg_keys_dir());
-        warned = 1;
-        return XPKG_OK;
+        if (xpkg_opts.allow_unsigned) {
+            static int warned;
+            if (!warned) xpkg_warn("no trusted keys in %s: repository signatures are not checked", xpkg_keys_dir());
+            warned = 1;
+            return XPKG_OK;
+        }
+        xpkg_err("no trusted keys in %s: cannot verify %s (use --allow-unsigned to override)", xpkg_keys_dir(), url);
+        return XPKG_ERR_SIGNATURE;
     }
     if (!sig) {
         if (xpkg_opts.allow_unsigned) {
@@ -210,13 +216,13 @@ static xpkg_status_t update_repo(int r, int *added, int *changed, int *removed) 
 
     char u[XPKG_MAX_URL];
     snprintf(u, sizeof(u), "%s/index.json", url);
-    if (xpkg_net_get(u, tidx, NULL) != XPKG_OK) {
+    if (xpkg_net_get(u, tidx, NULL, 64ULL << 20) != XPKG_OK) {
         xpkg_err("cannot fetch the index of %s", url);
         return XPKG_ERR_IO;
     }
     snprintf(u, sizeof(u), "%s/index.json.sig", url);
     xpkg_net_quiet_404 = 1;
-    int have_sig = xpkg_net_get(u, tsig, NULL) == XPKG_OK;
+    int have_sig = xpkg_net_get(u, tsig, NULL, 64ULL << 10) == XPKG_OK;
     xpkg_net_quiet_404 = 0;
     if (!have_sig) unlink(tsig);
 
@@ -345,7 +351,7 @@ xpkg_status_t xpkg_fetch_entry(const xpkg_entry_t *e, char *out, size_t n) {
     snprintf(url, sizeof(url), "%s/%s", g_repos[e->repo], e->file);
     snprintf(label, sizeof(label), "%s-%s", e->name, e->version);
     if (!xpkg_is_tty() && !xpkg_opts.quiet) printf("  downloading %s\n", label);
-    if (xpkg_net_get(url, out, label) != XPKG_OK) {
+    if (xpkg_net_get(url, out, label, e->size ? e->size : 4ULL << 30) != XPKG_OK) {
         xpkg_err("download of %s failed", label);
         return XPKG_ERR_IO;
     }

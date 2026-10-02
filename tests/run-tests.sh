@@ -140,6 +140,50 @@ check_fail "downgrade refused without --force" xpkg install "$T/repo/libfoo-1.0.
 check "downgrade with --force" xpkg --force install "$T/repo/libfoo-1.0.xpkg"
 check "repo list shows signed" sh -c "$RUN $XPKG_BIN repo list | grep -q signed"
 
+mv "$XPKG_ROOT/etc/xpkg/keys/test.pub" "$T/test.pub.off"
+check_fail "no trusted keys: index refused" xpkg update
+mv "$T/test.pub.off" "$XPKG_ROOT/etc/xpkg/keys/test.pub"
+
+mk big
+mkdir -p "$T/st/big/usr/share"; echo big > "$T/st/big/usr/share/big"
+create create --name big --version 1 --stage "$T/st/big" --output "$T/repo/big-1.xpkg" >/dev/null
+index
+head -c 300000 /dev/zero >> "$T/repo/big-1.xpkg"
+xpkg update >/dev/null 2>&1
+check "oversized download stopped at the indexed size" sh -c "! $RUN $XPKG_BIN install big >'$T/big.out' 2>&1 && grep -q 'larger than expected' '$T/big.out'"
+
+# hostile archives: a symlink planted by the package must not carry later
+# entries (or hardlinks) out of the extraction directory
+mkdir -p "$T/outside"
+evil() { # name, python tarfile body
+    python3 - "$T/repo/$1.xpkg" "$T/outside" "$2" <<'PY'
+import io, sys, tarfile
+out, outside, kind = sys.argv[1:]
+t = tarfile.open(out, "w:gz")
+def add(name, data=b"", **kw):
+    i = tarfile.TarInfo(name)
+    for k, v in kw.items(): setattr(i, k, v)
+    i.size = len(data) if i.type == tarfile.REGTYPE else 0
+    t.addfile(i, io.BytesIO(data) if i.type == tarfile.REGTYPE else None)
+add("pkg-info", b"NAME=evil-" + kind.encode() + b"\nVERSION=1\nARCH=x86_64\n")
+add("files/x", type=tarfile.SYMTYPE, linkname=outside)
+if kind == "file": add("files/x/pwned", b"owned\n")
+elif kind == "dir": add("files/x", type=tarfile.DIRTYPE, mode=0o777)
+elif kind == "link":
+    add("files/y", type=tarfile.LNKTYPE, linkname="files/x/secret")
+t.close()
+PY
+}
+echo secret > "$T/outside/secret"; chmod 700 "$T/outside"
+evil evil-file file
+check_fail "symlink-parent write refused" xpkg install "$T/repo/evil-file.xpkg"
+check "nothing written outside" test ! -e "$T/outside/pwned"
+evil evil-link link
+check_fail "hardlink through symlink refused" xpkg install "$T/repo/evil-link.xpkg"
+evil evil-dir dir
+xpkg install "$T/repo/evil-dir.xpkg" >/dev/null 2>&1
+check "dir entry over symlink does not chmod target" sh -c "[ \"\$(stat -c %a '$T/outside')\" = 700 ]"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -29,8 +29,8 @@ end.
 
 - **Signed indexes.** A repository serves `index.json` and `index.json.sig`,
   an Ed25519 signature of the exact index bytes. Keys trusted by a system live
-  in `/etc/xpkg/keys/*.pub`; when any key is installed, an unsigned or
-  wrongly signed index is refused. The index pins every archive's size and
+  in `/etc/xpkg/keys/*.pub`; an unsigned or wrongly signed index is refused,
+  and so is every index when no key is installed. The index pins every archive's size and
   SHA-256, so a verified index vouches for every package it lists.
 - **Rollback protection.** `generated` in the index may not go backwards
   between updates, so a mirror cannot replay an old signed index.
@@ -105,10 +105,11 @@ FreeLinX/ports dependencies.
 tests/run-tests.sh <xpkg> <xpkg-create> [runner]
 ```
 
-runs 43 end-to-end checks against a signed repository served on localhost:
+runs 49 end-to-end checks against a signed repository served on localhost:
 dependency resolution, conflicts, config protection, upgrades and stale files,
-hardlinks, pax paths, setuid bits, tampered and unsigned indexes, corrupted
-archives, removal guards and autoremove.
+hardlinks, pax paths, setuid bits, tampered and unsigned indexes, a missing key
+directory, oversized downloads, corrupted archives, archives that plant a symlink to write outside
+the extraction directory, removal guards and autoremove.
 
 ## State
 

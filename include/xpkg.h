@@ -145,7 +145,10 @@ xpkg_status_t xpkg_tar_extract(const char *archive_path, const char *dest_dir);
 /* --- net.c -------------------------------------------------------------- */
 /* GET url into dest_path (via dest_path.part).  label, when non-NULL, turns
  * on a progress bar on a terminal. */
-xpkg_status_t xpkg_net_get(const char *url, const char *dest_path, const char *label);
+/* max: the most bytes the body may have; a larger one is refused (a mirror
+ * cannot fill the disk before the checksum is even looked at) */
+xpkg_status_t xpkg_net_get(const char *url, const char *dest_path, const char *label,
+                           unsigned long long max);
 extern int xpkg_net_quiet_404;   /* a missing file is expected (index.json.sig) */
 
 /* --- db.c --------------------------------------------------------------- */
