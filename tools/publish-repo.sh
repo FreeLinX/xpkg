@@ -40,6 +40,16 @@ for d in "$TOP/ports/packages" "$W/pkgs"; do
     done
 done
 echo "publish: $(ls "$OUT"/*.xpkg | wc -l) archives"
+# 0. one archive per package name: a second, older copy would be uploaded
+#    as a dead file and is a sign the two sources disagree
+dups=$(for f in "$OUT"/*.xpkg; do tar -xzOf "$f" pkg-info 2>/dev/null | sed -n 's/^NAME=//p'; done | sort | uniq -d)
+if [ -n "$dups" ]; then
+    for n in $dups; do
+        echo "publish: more than one archive for $n:" $(cd "$OUT" && ls "$n"-[0-9]*.xpkg) >&2
+    done
+    echo "publish: remove the stale copies; nothing published" >&2
+    exit 1
+fi
 
 # 1. no-GNU gate
 T="$(mktemp -d)"
