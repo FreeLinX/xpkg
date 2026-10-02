@@ -1,0 +1,18 @@
+# Build xpkg on musl with clang (Alpine) and run the end-to-end tests.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: alpine:3.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: apk add --no-cache clang lld musl-dev openssl-dev zlib-dev sqlite-dev python3 coreutils
+      - name: Build
+        run: |
+          mkdir -p out
+          clang -O2 -Wall -Iinclude src/*.c -o out/xpkg -lsqlite3 -lz -lssl -lcrypto
+          clang -O2 -Wall -Iinclude tools/xpkg-create.c -o out/xpkg-create -lz -lcrypto
+      - name: Tests
+        run: sh tests/run-tests.sh "$PWD/out/xpkg" "$PWD/out/xpkg-create"

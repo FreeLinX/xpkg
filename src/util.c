@@ -60,7 +60,10 @@ int xpkg_mkdir_p(const char *path, unsigned mode) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+            /* parents are ordinary directories: "mode" is for the last one
+             * only (a private 0700 scratch dir must not make /var/cache
+             * unreadable for everyone) */
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
             *p = '/';
         }
     }

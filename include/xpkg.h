@@ -22,7 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define XPKG_VERSION        "1.0.0"
+#define XPKG_VERSION        "1.0.1"
 
 #define XPKG_DB_DIR_DEFAULT     "/var/lib/xpkg"
 #define XPKG_CACHE_DIR_DEFAULT  "/var/cache/xpkg"
