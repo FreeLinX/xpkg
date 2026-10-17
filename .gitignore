@@ -1,0 +1,4 @@
+*.o
+xpkg
+xpkg.exe
+xpkg-create
